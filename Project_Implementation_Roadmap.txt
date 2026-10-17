@@ -1,0 +1,116 @@
+CAP 6545 FINAL PROJECT — IMPLEMENTATION ROADMAP
+Project: Training-data supervision versus inference-time localization for liver tumor CT segmentation
+Models: MedSAM2 (zero-shot prompted), EoMT (fine-tuned automatic), optional EoMT -> MedSAM2 hybrid
+Dataset: WAW-TACE
+Prepared: 2026-10-17
+
+PROJECT GOAL
+Measure how many labeled training patients EoMT needs to approach MedSAM2's zero-shot performance when MedSAM2 receives ground-truth-derived localization prompts. Analyze prompt perturbation and tumor size. Do NOT characterize a ground-truth-box MedSAM2 baseline as fully automatic; it receives privileged localization information.
+
+AUTHORITATIVE SOURCES
+WAW-TACE Zenodo: https://zenodo.org/records/12741586
+Official MedSAM2: https://github.com/bowang-lab/MedSAM2
+Official EoMT: https://github.com/tue-mps/eomt
+Proposal: Final Project Proposal.pdf (provided with this task)
+
+DECISIONS TO RECORD BEFORE EXPERIMENTS
+[ ] Work on one WAW-TACE CT archive initially, plus metadata and ALL tumor masks.
+[ ] Use patient-level train/validation/test splits, with a fixed random seed and a frozen test set.
+[ ] Treat patient-phase as an image unit and a patient as the split unit; document multi-tumor handling.
+[ ] Establish a volume-level 3D evaluation protocol; document lesion-level results separately if possible.
+[ ] Choose a consistent 2D/3D conversion policy for both architectures; document input windows, interpolation, dimensions, and reconstruction.
+[ ] Define what an exact bounding box means (e.g., GT lesion extent on designated key slice or GT 3D extent) based on the actual MedSAM2 API; document exactly which image/mask information generates it.
+[ ] Distinguish cases with tumor annotations from CT phases without matching tumor segmentation; do not assume absent annotations imply no tumor.
+[ ] Lock experiment configurations, metrics, and split manifests before generating headline test-set results.
+
+PHASE 1 — REPOSITORY AND ENVIRONMENT
+[ ] Create a Git repository with src/, configs/, scripts/, tests/, results/, docs/, and data/ directories.
+[ ] Keep raw datasets, cached volumes, checkpoints, and any patient data out of Git; use .gitignore.
+[ ] Create a reproducible Python environment and record versions, CUDA/GPU, seeds, and git commit IDs.
+[ ] Keep MedSAM2 and EoMT upstream code and checkpoint licenses intact; pin tested commits/checkpoint provenance.
+[ ] Support --device cuda and a CPU smoke-test mode where feasible.
+[ ] Create README with setup commands, storage needs, dataset links, and run commands.
+[ ] Create a Newton-compatible SLURM script, with partition/account/GPU settings as placeholders, NOT fabricated values.
+Milestone: a clean environment and a successful import / checkpoint-loader smoke test.
+
+PHASE 2 — DATA ACQUISITION AND AUDIT (WEEK 1)
+[ ] Verify the dataset file list and actual download links on Zenodo.
+[ ] Download ct_hcc_metadata_v2.csv and tumor_masks_wawtace_v1_08_05_2024.zip.
+[ ] Download ONE of the four CT archives (suggest ct_scans_1_4_wawtace_09_05_24.zip); this archive is about 10.4 GB.
+[ ] Check available free storage, resumability, and checksums (Zenodo MD5) before extracting.
+[ ] Inspect archive paths, CT files, mask formats, and metadata fields; don't assume NIfTI/DICOM until inspected.
+[ ] Build an inventory of patients, CT phases, tumors, mask file IDs, voxel dimensions, spacing, affine/orientation, and data quality issues.
+[ ] WAW-TACE masks are phase-specific. The reported phase codes are 0=native, 1=arterial, 2=portal, 3=delayed. Match masks to the exact CT phase using filename + metadata and confirm alignment visually and geometrically.
+[ ] If multiple tumor masks belong to one phase, preserve instance masks and create a union mask for binary volume segmentation; document this decision.
+[ ] Identify all usable patient-phase-mask triples; log excluded/missing/misaligned pairs with reasons.
+[ ] Make deterministic split manifests at PATIENT level. All phases and lesions for each patient must remain in only one split.
+[ ] From TRAIN patients only, make nested labeled subsets of 1, 2, 5, 10, 20, and all eligible training patients; adapt sizes if inventory is smaller, and document changes.
+Milestone: downloadable raw data, checked inventory, matched pairs, frozen split manifests.
+
+PHASE 3 — PREPROCESSING + COMMON EVALUATION (WEEK 2)
+[ ] Read CT images in their real format; preserve spacing, orientation, affine and source filenames.
+[ ] Read and verify masks in the corresponding CT coordinate space. Do not blindly resize unrelated image and mask grids.
+[ ] Convert intensity to HU if appropriate for the verified format; choose a documented CT window and normalize.
+[ ] Use linear/bilinear interpolation for CT and nearest-neighbor for label masks.
+[ ] Cache standardized images, binary tumor masks, transforms, and provenance in a stable intermediate representation.
+[ ] Build visual QC: representative axial slices, masks overlaid on scans, and prompt boxes; flag misalignment.
+[ ] Build one evaluation module for both methods: at least 3D Dice and 3D IoU, with optional HD95 and surface Dice only if spacing/edge cases are handled correctly. Define empty-mask policy.
+[ ] Aggregate by patient rather than treating correlated slices as independent test cases. Handle patients with multiple volumes deliberately (per-volume then per-patient aggregate).
+[ ] Produce one CSV/JSONL record per patient-phase and experimental condition, with metadata and metrics.
+[ ] Add unit tests for alignment, bounding-box extraction, perturbation clipping, inverse transforms, and metrics.
+Milestone: one correctly visualized CT/mask pair and reproducible metrics on synthetic known masks.
+
+PHASE 4 — MEDSAM2 ZERO-SHOT BASELINE (WEEK 3; PRIORITY NOW)
+[ ] Clone/pin official MedSAM2 and download its recommended checkpoint via the documented repository procedure.
+[ ] Read official inference examples and adapt to the real WAW-TACE volume format; do not substitute original MedSAM for MedSAM2.
+[ ] Implement MedSAM2 loading and a reproducible 3D inference adapter compatible with the official architecture and prompt semantics.
+[ ] Construct the designated prompt from ground-truth tumor mask(s) solely for the prompted baseline, exactly as documented; keep GT masks away from prediction post-processing and model input other than the permitted prompt.
+[ ] Start with exact GT box; then create seeded, bounded perturbation conditions (e.g., mild and strong expansion, translation or jitter). Specify pixel vs physical-unit perturbations; reject/record invalid boxes.
+[ ] For multi-lesion cases, define whether prompting is lesion-by-lesion and union results or a single enclosing prompt. Keep this consistent and report it.
+[ ] Test 1 volume end-to-end; inspect input, box, predicted mask, restored native geometry, and overlay.
+[ ] Run small debug batches first; then full frozen test split once everything is verified.
+[ ] Save masks in native space (NIfTI if supported), per-patient metrics, exact prompts/seed, runtime, failure logs, and overlays.
+[ ] Compare exact vs perturbed prompting; stratify by tumor size/volume. Do not tune prompt policy on the held-out test set.
+Milestone: reproducible zero-shot MedSAM2 evaluation with an exact-box baseline and at least one perturbation setting.
+
+PHASE 5 — EOMT FINETUNING (WEEKS 4–5)
+[ ] Pin and install the official EoMT code and pretrained weights.
+[ ] Implement binary tumor segmentation for 2D CT slices, with reconstruction to full native 3D volume for common evaluation; document handling of tumor-negative slices.
+[ ] Train a tiny subset first (1–2 patients), checking loss, labels, shapes, and overfit behavior.
+[ ] Define patient-level sampling, learning-rate schedule, augmentation, seeds, early stopping, checkpoint selection from validation only.
+[ ] Run nested training subset sizes: 1, 2, 5, 10, 20, full available; no patient from validation/test may enter training.
+[ ] Evaluate all trained versions on the same held-out test set as MedSAM2.
+[ ] Save learning curves, labels/patient count, GPU hours, predicted volumes, and metrics.
+Milestone: label-efficiency curve for EoMT against the fixed MedSAM2 baseline.
+
+PHASE 6 — OPTIONAL HYBRID (WEEK 6)
+[ ] Generate a localization proposal using EoMT predictions, never ground-truth masks.
+[ ] Convert EoMT predicted region(s) into valid MedSAM2 prompt box(es), with a documented fallback when EoMT predicts no lesion.
+[ ] Run MedSAM2 without user or ground-truth prompting and evaluate on the same held-out patients.
+[ ] Report end-to-end performance and prompt-failure rate, including lesions EoMT misses.
+Milestone: hybrid results if time/compute permit; core label-efficiency work takes priority.
+
+PHASE 7 — ANALYSIS AND DELIVERABLES (WEEKS 7–8)
+[ ] Plot EoMT 3D Dice versus number of labeled training patients; overlay MedSAM2 exact/perturbed-box baselines.
+[ ] Plot performance by tumor size with a predeclared method for binning lesions/volumes.
+[ ] Quantify prompt sensitivity, patient-level uncertainty intervals (optional), runtime, and failure cases.
+[ ] Explicitly separate localization supervision from boundary delineation; do not claim equal inference conditions.
+[ ] Discuss sample size, single-archive coverage, imperfect mask-phase alignment, and annotation/selection limitations.
+[ ] Prepare reproducible commands, configuration snapshots, tables, figures, final report and presentation.
+
+IMMEDIATE SUCCESS CRITERIA FOR CLAUDE CODE'S FIRST PASS
+1. A working repository, environment instructions, and pinned dependencies.
+2. An actual Zenodo-backed data downloader for metadata, masks, and ONE CT archive, with resume/checksum/storage checks.
+3. A dataset inventory and patient-level split generator that handles phase-specific and multi-lesion masks.
+4. A geometry-safe preprocessing/QC pipeline and shared 3D metric calculator.
+5. A real MedSAM2 adapter, exact-/perturbed-box prompt generator, and zero-shot evaluation CLI.
+6. Smoke tests runnable on one genuine matched volume, plus SLURM launch template.
+7. Clear README and a status summary of what was actually executed, what was only written, and what remains blocked (e.g., weights, download, GPU).
+
+IMPORTANT SAFEGUARDS
+- No test-patient leakage into training or model selection.
+- A ground-truth-derived box is permitted only as the declared MedSAM2 prompted baseline, not as an automatic system.
+- Never derive prompt positions for the hybrid from reference masks.
+- Do not report synthetic smoke-test scores as research results.
+- Never claim a successful download, matching, model inference, or evaluation unless it has actually run.
+- Keep source scans and masks out of public commits; respect dataset terms.
