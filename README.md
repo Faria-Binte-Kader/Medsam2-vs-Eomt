@@ -38,20 +38,3 @@ python download_data.py --list ct_scans_1_4_wawtace_09_05_24.zip       # inspect
 python download_data.py --extract tumor_masks_wawtace_v1_08_05_2024.zip
 python download_data.py --extract ct_scans_1_4_wawtace_09_05_24.zip --pattern "<fnmatch pattern>"
 ```
-Interrupted? Re-run the same command; it resumes the `.part` file. Files are only renamed into place after the MD5 matches Zenodo's.
-Set `WAWTACE_RAW_DIR` first if the default `data/raw` is on a small disk.
-
-## Storage
-CT archive 1/4 is 10.36 GB (kept as a ZIP); masks 2.3 MB; checkpoint 156 MB. Plan for ~40 GB free
-(conservative estimate).
-
-## Pins (verified 2026-10-17)
-- MedSAM2 commit `332f30d420f1d1b08e2a79b3ae6a602458808383` (Apache-2.0)
-- Checkpoint `wanglab/MedSAM2` @ `e4a6f35edd7e091619cbc0750f462f1574e23955`, `MedSAM2_latest.pt`,
-  SHA-256 `c92743b99f00d078bf32a3afcc38aaa9faf1c1692dffe3eaa7a90938c1991060`
-
-## Data
-WAW-TACE, Zenodo 12741586 (CC-BY-4.0). Data, weights and results are git-ignored; do not commit them.
-
-## Status
-Done: config, MedSAM2 fetch script, downloader. Tests: 12 pass locally (downloader tested against a local HTTP server: resume, retry, MD5 failure, disk check, safe extraction). The `--dry-run` against the live Zenodo API worked; no real data has been downloaded, extracted or inspected yet.
