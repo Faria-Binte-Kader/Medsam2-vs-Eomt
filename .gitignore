@@ -17,3 +17,10 @@ logs/
 __pycache__/
 .pytest_cache/
 .DS_Store
+
+# local copies of debug runs
+val_dbg*/
+overlays/
+val_*/
+test_*/
+secondary_*/

@@ -117,3 +117,19 @@ reported separately (run directories `<split>_<mode>`); the in-plane box and key
 If a run prints `undefined symbol ... _C.so` and "Skipping the post-processing step", the compiled extension does not match the installed torch and small-hole filling is skipped.
 Rebuild it (`cd MedSAM2 && rm -f sam2/_C.so && pip install --no-build-isolation -e .`, needs a CUDA toolkit matching torch's CUDA version). Whichever way, the state is recorded
 in `config_snapshot.json` (`sam2_cuda_extension`); use one state for every reported run.
+
+### Known deviation: sam2 compiled extension not built
+The lab server has no `nvcc`, so MedSAM2's optional `sam2._C` extension is not built and the predictor skips its small-hole filling post-processing (`fill_hole_area=8` on the
+low-resolution masks, a few pixels). Every reported run, validation and test, uses this same state, recorded as `sam2_cuda_extension` in each `config_snapshot.json`. Report it in the methods.
+
+## Analysis plan for the frozen MedSAM2 baseline (written before any test result existed)
+Decided after the validation run (`val`, 14 patients) and before touching `test`:
+- **Headline protocol:** `--z-mode unbounded` (one GT-derived box on the lesion's key slice, propagated through the volume; least ground-truth information). **Secondary / sensitivity:**
+  `--z-mode gt_extent` (adds the GT z range to bound propagation). Both are reported; neither is chosen from test results. No other protocol, window, post-processing or condition will be added.
+- **Conditions:** exact, mild, strong (config.PROMPT_CONDITIONS). Mild is the preregistered "small localization error" condition; strong is the "large error" condition.
+- **Units and aggregation:** per-volume metrics (Dice, IoU, HD95), then per-patient means, then mean / median / std and a seeded bootstrap 95% CI over patients. Test n = 14 patients, so intervals are wide.
+- **Outliers stay in.** Failures (for example a very large, nearly isodense tumor where the tracker drifts onto the whole liver, as seen on val patient 8) are reported, not excluded.
+- **Size analysis:** predeclared bins <10, 10-50, >=50 mL. Test has 2 / 5 / 7 patients per bin, so the small bin is descriptive only; lesion-level results (more observations, not independent) are reported separately.
+- **Primary vs secondary set:** headline numbers use the 14 primary test patients only. The 12-patient secondary set (relabelled or resampled masks, 1 / 2 / 9 per size bin) is reported separately.
+- **What val showed (development only):** mean exact Dice 0.810 (unbounded) and 0.820 (gt_extent); strong perturbation is much worse (0.544 / 0.604); patient 8 (499 mL) over-segmented 2.5 to 3 times; patient 59 under-segmented (volume ratio 0.37).
+- **Known deviation:** sam2 compiled extension not built (see above), identical for all runs.
