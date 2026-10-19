@@ -2,6 +2,9 @@
 
   python process_data.py names                      # parse archive member names (no pixel data read)
   python process_data.py inspect --patients 10 13   # read real headers/intensities, compare geometry
+  python process_data.py manifest                   # inventory.csv + excluded.csv (matching, geometry checks)
+  python process_data.py splits                     # splits.json/csv + nested train subsets
+  python process_data.py qc --n 12                  # overlay + summary figures
 
 File-name conventions below were read from the real archive listings:
   CT   <p>/<p>_<phase>_scan.nii.gz
@@ -13,6 +16,7 @@ Axis note: SimpleITK sizes/spacings/origins are (x, y, z); numpy arrays from
 GetArrayFromImage are (z, y, x).
 """
 import argparse
+import gzip
 import json
 import re
 import sys
@@ -163,6 +167,290 @@ def cmd_inspect(a):
     print(f"\nwrote {a.out}")
 
 
+# ----------------------------------------------------------------------------- manifest
+def ct_header_from_zip(zf, member):
+    """CT geometry from the first 348 bytes of the gzip'd NIfTI inside the ZIP (no extraction).
+
+    Returned in SimpleITK's convention (LPS, x/y/z) so it is directly comparable with NRRD
+    masks read by SimpleITK. Also reports scl_slope/scl_inter: if they are not 1/0 the stored
+    values would not be HU.
+    """
+    import nibabel as nib
+    with zf.open(member) as f, gzip.GzipFile(fileobj=f) as g:
+        h = nib.Nifti1Header.from_fileobj(g)
+    shape = h.get_data_shape()
+    if len(shape) != 3:
+        raise ValueError(f"{member}: expected 3D, got shape {shape}")
+    A = h.get_best_affine()
+    zooms = np.array(h.get_zooms()[:3], dtype=float)
+    flip = np.diag([-1.0, -1.0, 1.0])  # RAS -> LPS
+    slope, inter = h.get_slope_inter()
+    return {
+        "size_xyz": [int(x) for x in shape], "spacing_xyz": zooms.tolist(),
+        "origin_xyz": (flip @ A[:3, 3]).tolist(), "direction": (flip @ (A[:3, :3] / zooms)).flatten().tolist(),
+        "pixel_type": str(h.get_data_dtype()),
+        "scl_slope": None if slope is None or np.isnan(slope) else float(slope),
+        "scl_inter": None if inter is None or np.isnan(inter) else float(inter),
+    }
+
+
+def union_mask(arrays):
+    """Binary union (uint8) of instance masks; also returns the number of voxels covered by >1 instance."""
+    stack = np.stack([np.asarray(a) > 0 for a in arrays])
+    return stack.any(0).astype(np.uint8), int((stack.sum(0) > 1).sum())
+
+
+def mask_array(path):
+    import SimpleITK as sitk
+    return sitk.GetArrayFromImage(sitk.ReadImage(str(path)))
+
+
+def _crc_key(info):
+    return (info.CRC, info.file_size)
+
+
+def build_manifest(raw_dir=None, extract_dir=None, patients=None):
+    """Match masks to CTs by exact (patient, phase), verify grids, and return (inventory, excluded) DataFrames."""
+    import pandas as pd
+    import download_data as D
+    raw, ext = Path(raw_dir or C.RAW_DIR), Path(extract_dir or C.EXTRACT_DIR)
+    ct_zip, mask_zip = raw / "ct_scans_1_4_wawtace_09_05_24.zip", raw / "tumor_masks_wawtace_v1_08_05_2024.zip"
+    meta = pd.read_csv(raw / "ct_hcc_metadata_v2.csv")
+    csv_idx = {(int(r.patient_id), int(r.ct_phase)): r for r in meta.itertuples()}
+    excluded = []
+
+    def exc(patient, phase, item, reason, detail=""):
+        excluded.append({"patient_id": patient, "phase": phase, "item": item, "reason": reason, "detail": detail})
+
+    cts, odd_ct = parse_archive_names(ct_zip, parse_ct_name)
+    for name in odd_ct:
+        exc(None, None, name, "nonconforming_ct_name")
+    cts = [e for e in cts if patients is None or e["patient"] in patients]
+
+    with zipfile.ZipFile(ct_zip) as zc:
+        ct_hdr = {}
+        for e in cts:
+            key = (e["patient"], e["phase"])
+            if key in ct_hdr:
+                exc(*key, e["member"], "duplicate_ct_for_patient_phase")
+                continue
+            ct_hdr[key] = (e["member"], ct_header_from_zip(zc, e["member"]))
+
+    masks, odd_m = parse_archive_names(mask_zip, parse_mask_name)
+    with zipfile.ZipFile(mask_zip) as zm:
+        infos = {i.filename: i for i in zm.infolist()}
+    for name in odd_m:
+        sib = re.sub(r"\.nrrd$", "_tumor_seg.nrrd", name)
+        same = sib in infos and _crc_key(infos[sib]) == _crc_key(infos[name])
+        exc(None, None, name, "nonconforming_mask_name",
+            f"identical bytes (CRC32+size) to {sib}" if same else f"sibling {sib} present={sib in infos}, not identical")
+    groups = defaultdict(list)
+    for e in sorted(masks, key=lambda e: (e["patient"], e["phase"], e["instance"])):
+        groups[(e["patient"], e["phase"])].append(e)
+
+    for key, es in groups.items():
+        if key not in ct_hdr and (patients is None or key[0] in patients):
+            exc(*key, f"{len(es)} mask file(s)", "ct_not_in_downloaded_archive",
+                "mask has no CT of the same patient+phase in archive 1/4 (not an error)")
+
+    rows = []
+    for key in sorted(ct_hdr):
+        patient, phase = key
+        member, h = ct_hdr[key]
+        r = csv_idx.get(key)
+        row = {
+            "patient_id": patient, "phase": phase, "phase_name": C.PHASES[phase], "ct_member": member,
+            **{f"size_{a}": v for a, v in zip("xyz", h["size_xyz"])},
+            **{f"spacing_{a}": v for a, v in zip("xyz", h["spacing_xyz"])},
+            **{f"origin_{a}": v for a, v in zip("xyz", h["origin_xyz"])},
+            "direction": json.dumps([round(x, 6) + 0.0 for x in h["direction"]]),
+            "ct_dtype": h["pixel_type"], "scl_slope": h["scl_slope"], "scl_inter": h["scl_inter"],
+            "csv_ct_file_name": getattr(r, "ct_file_name", None), "csv_tumor_count": getattr(r, "tumor_count", None),
+            "csv_slice_thickness": getattr(r, "slice_thickness", None),
+        }
+        row["csv_thickness_matches_z"] = (None if r is None else bool(abs(r.slice_thickness - h["spacing_xyz"][2]) < 0.01))
+        if r is None:
+            exc(patient, phase, member, "ct_missing_from_metadata_csv")
+        es, seen, used, arrays = groups.get(key, []), {}, [], []
+        row["n_mask_files"] = len(es)
+        reason = None
+        for e in es:
+            info = infos[e["member"]]
+            if _crc_key(info) in seen:
+                exc(patient, phase, e["member"], "duplicate_instance",
+                    f"identical bytes (CRC32+size) to instance {seen[_crc_key(info)]}; dropped")
+                continue
+            seen[_crc_key(info)] = e["instance"]
+            D.safe_extract(mask_zip, ext, e["member"])
+            path = ext / e["member"]
+            ok, why = same_grid(header(path), h)
+            if not ok:
+                reason = "mask_grid_mismatch: " + "; ".join(why)
+                exc(patient, phase, e["member"], "mask_grid_mismatch", "; ".join(why))
+                continue
+            a = mask_array(path)
+            labels = set(np.unique(a).tolist())
+            if not labels <= {0, 1}:
+                reason = f"unexpected_mask_labels {sorted(labels)}"
+                exc(patient, phase, e["member"], "unexpected_mask_labels", str(sorted(labels)))
+                continue
+            if not a.any():
+                exc(patient, phase, e["member"], "empty_instance", "dropped")
+                continue
+            used.append(e)
+            arrays.append(a)
+        row["instance_ids"] = json.dumps([e["instance"] for e in used])
+        row["mask_members"] = json.dumps([e["member"] for e in used])
+        row["n_instances_used"] = len(used)
+        row["csv_count_matches_files"] = (None if r is None or not es else int(r.tumor_count) == len(es))
+        if used:
+            u, overlap = union_mask(arrays)
+            vox = int(u.sum())
+            row.update(instance_voxels=json.dumps([int(a.sum()) for a in arrays]), union_voxels=vox,
+                       instance_overlap_voxels=overlap,
+                       union_volume_ml=vox * float(np.prod(h["spacing_xyz"])) / 1000.0)
+        if reason is None and not es:
+            reason = "no_mask_for_phase (unannotated; NOT assumed tumor-negative)"
+        elif reason is None and not used:
+            reason = "all_instances_empty_or_duplicate"
+        row["usable"], row["reason"] = reason is None and bool(used), reason or "ok"
+        rows.append(row)
+    return pd.DataFrame(rows), pd.DataFrame(excluded)
+
+
+def cross_check_ct_header(ct_zip, member, extract_dir):
+    """Verify the ZIP-header reader against SimpleITK on one real scan; raises on disagreement."""
+    import download_data as D
+    with zipfile.ZipFile(ct_zip) as zc:
+        mine = ct_header_from_zip(zc, member)
+    D.safe_extract(ct_zip, extract_dir, member)
+    path = Path(extract_dir) / member
+    ref = header(path)
+    ok, why = same_grid(mine, ref)
+    path.unlink()
+    if not ok:
+        raise RuntimeError(f"ZIP-header geometry disagrees with SimpleITK for {member}: {why}")
+    return True
+
+
+# ----------------------------------------------------------------------------- splits
+def make_splits(patients, ratios=None, seed=None, subset_sizes=None):
+    """Patient-level split + nested TRAIN subsets (prefixes of one seeded train ordering)."""
+    ratios, seed = ratios or C.SPLIT_RATIOS, C.SEED if seed is None else seed
+    subset_sizes = subset_sizes or C.TRAIN_SUBSET_SIZES
+    ids = sorted({int(p) for p in patients})
+    n = len(ids)
+    order = [ids[i] for i in np.random.default_rng(seed).permutation(n)]
+    n_test, n_val = round(ratios["test"] * n), round(ratios["val"] * n)
+    if n >= 3:
+        n_test, n_val = max(n_test, 1), max(n_val, 1)
+    test, val, train = order[:n_test], order[n_test:n_test + n_val], order[n_test + n_val:]
+    notes, subsets = [], {}
+    for k in subset_sizes:
+        size = len(train) if k == "all" else int(k)
+        if size > len(train):
+            notes.append(f"requested train subset {k} > {len(train)} available train patients; skipped")
+            continue
+        subsets["all" if k == "all" else str(k)] = train[:size]
+    if "all" in subsets and str(len(train)) in subsets:
+        notes.append(f"'all' equals {len(train)}")
+    s = {"train": set(train), "val": set(val), "test": set(test)}
+    assert not (s["train"] & s["val"] or s["train"] & s["test"] or s["val"] & s["test"]), "patient leakage"
+    assert len(train) + len(val) + len(test) == n
+    return {"seed": seed, "ratios": ratios, "n_patients": n, "counts": {k: len(v) for k, v in s.items()},
+            "train": train, "val": val, "test": test, "train_subsets": subsets, "notes": notes}
+
+
+# ----------------------------------------------------------------------------- QC figures
+def cmd_manifest(a):
+    import pandas as pd
+    out = Path(a.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    inv, exc_df = build_manifest(patients=set(a.patients) if a.patients else None)
+    inv.to_csv(out / "inventory.csv", index=False)
+    exc_df.to_csv(out / "excluded.csv", index=False)
+    if len(inv):
+        first = inv.iloc[0]
+        cross_check_ct_header(C.RAW_DIR / "ct_scans_1_4_wawtace_09_05_24.zip", first["ct_member"], C.EXTRACT_DIR)
+        print(f"header cross-check vs SimpleITK OK on {first['ct_member']}")
+    use = inv[inv.usable]
+    print(f"CT scans in archive: {len(inv)}; usable patient-phase-mask tuples: {len(use)}; "
+          f"patients: {use.patient_id.nunique()}")
+    print("not usable:", dict(inv[~inv.usable].reason.str.split(" ").str[0].value_counts()))
+    print("excluded-log reasons:", dict(exc_df.reason.value_counts()) if len(exc_df) else {})
+    print("usable by phase:", dict(use.phase_name.value_counts()))
+    print("CSV tumor_count == #mask files (annotated phases):",
+          dict(inv[inv.n_mask_files > 0].csv_count_matches_files.value_counts(dropna=False)))
+    print("CSV slice_thickness == header z-spacing:", dict(inv.csv_thickness_matches_z.value_counts(dropna=False)))
+    print("CT dtypes:", dict(inv.ct_dtype.value_counts()), "| scl_slope/inter values:",
+          sorted({(r.scl_slope, r.scl_inter) for r in inv.itertuples()}, key=str))
+    print(f"wrote {out}/inventory.csv and excluded.csv")
+
+
+def cmd_splits(a):
+    import pandas as pd
+    out = Path(a.out_dir)
+    inv = pd.read_csv(out / "inventory.csv")
+    pats = inv[inv.usable].patient_id.unique()
+    sp = make_splits(pats)
+    (out / "splits.json").write_text(json.dumps(sp, indent=1))
+    rows = []
+    for name in ("train", "val", "test"):
+        for p in sp[name]:
+            first = next((int(k) for k, v in sp["train_subsets"].items() if k != "all" and p in v), None) \
+                if name == "train" else None
+            rows.append({"patient_id": p, "split": name, "smallest_nested_train_subset": first})
+    pd.DataFrame(rows).sort_values("patient_id").to_csv(out / "splits.csv", index=False)
+    print(f"seed {sp['seed']}, ratios {sp['ratios']}, patients {sp['n_patients']}: {sp['counts']}")
+    print("nested train subsets:", {k: len(v) for k, v in sp["train_subsets"].items()}, sp["notes"])
+
+
+def cmd_qc(a):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import SimpleITK as sitk
+    import download_data as D
+    out = Path(a.out_dir)
+    inv = pd.read_csv(out / "inventory.csv")
+    use = inv[inv.usable]
+    pick = use.sample(n=min(a.n, len(use)), random_state=C.SEED)
+    ct_zip = C.RAW_DIR / "ct_scans_1_4_wawtace_09_05_24.zip"
+    cols = 4
+    fig, axes = plt.subplots((len(pick) + cols - 1) // cols, cols, figsize=(4 * cols, 4 * ((len(pick) + cols - 1) // cols)))
+    axes = np.atleast_1d(axes).ravel()
+    lo, hi = C.HU_WINDOW
+    for ax, (_, r) in zip(axes, pick.iterrows()):
+        D.safe_extract(ct_zip, C.EXTRACT_DIR, r.ct_member)
+        ct_path = C.EXTRACT_DIR / r.ct_member
+        ct = sitk.GetArrayFromImage(sitk.ReadImage(str(ct_path)))
+        ct_path.unlink()
+        u, _ = union_mask([mask_array(C.EXTRACT_DIR / m) for m in json.loads(r.mask_members)])
+        z = int(np.argmax(u.sum((1, 2))))
+        ax.imshow(np.clip(ct[z], lo, hi), cmap="gray", vmin=lo, vmax=hi)
+        ax.contour(u[z], levels=[0.5], colors="red", linewidths=0.8)
+        ys, xs = np.nonzero(u[z])
+        pad = 40
+        ax.set_xlim(max(xs.min() - pad, 0), min(xs.max() + pad, ct.shape[2]))
+        ax.set_ylim(min(ys.max() + pad, ct.shape[1]), max(ys.min() - pad, 0))
+        ax.set_title(f"p{r.patient_id} {r.phase_name} z={z}/{ct.shape[0]} n={r.n_instances_used}", fontsize=9)
+        ax.axis("off")
+    for ax in axes[len(pick):]:
+        ax.axis("off")
+    fig.suptitle(f"Mask (red) on its own CT phase, window {lo:.0f}..{hi:.0f} HU, array order (not radiological)")
+    fig.tight_layout()
+    fig.savefig(out / "qc_overlays.png", dpi=110)
+    fig2, ax2 = plt.subplots(1, 3, figsize=(13, 3.5))
+    ax2[0].hist(use.union_volume_ml.dropna(), bins=np.geomspace(max(use.union_volume_ml.min(), 0.01), use.union_volume_ml.max(), 20))
+    ax2[0].set_xscale("log"); ax2[0].set_xlabel("union tumor volume (mL)")
+    ax2[1].hist(use.spacing_z, bins=15); ax2[1].set_xlabel("z spacing (mm)")
+    ax2[2].hist(use.n_instances_used, bins=np.arange(0.5, use.n_instances_used.max() + 1.5)); ax2[2].set_xlabel("instances per tuple")
+    fig2.tight_layout()
+    fig2.savefig(out / "qc_summary.png", dpi=110)
+    print(f"wrote {out}/qc_overlays.png and qc_summary.png")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -171,5 +459,13 @@ if __name__ == "__main__":
     s.add_argument("--patients", type=int, nargs="+", default=[10, 13])
     s.add_argument("--out", default=str(C.OUTPUT_DIR / "inspect_report.json"))
     s.set_defaults(fn=cmd_inspect)
+    for name, fn in (("manifest", cmd_manifest), ("splits", cmd_splits), ("qc", cmd_qc)):
+        s = sub.add_parser(name)
+        s.add_argument("--out-dir", default=str(C.MANIFEST_DIR))
+        if name == "manifest":
+            s.add_argument("--patients", type=int, nargs="+", help="debug: restrict to these patients")
+        if name == "qc":
+            s.add_argument("--n", type=int, default=12)
+        s.set_defaults(fn=fn)
     a = ap.parse_args()
     a.fn(a)

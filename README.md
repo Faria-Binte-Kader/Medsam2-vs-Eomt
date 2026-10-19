@@ -7,7 +7,7 @@ not a fully automatic one.
 - `config.py` – paths, seed, device, CT window, split ratios, MedSAM2 pins, prompt perturbations
 - `fetch_medsam2.py` – clones MedSAM2 at the pinned commit, downloads and SHA-256-checks `MedSAM2_latest.pt`
 - `download_data.py` – WAW-TACE downloader: Zenodo API URLs/MD5s, resumable, retried, atomic, disk check, safe selective ZIP extraction
-- `process_data.py` – inventory, splits, preprocessing (later step)
+- `process_data.py` – archive inspection, manifest/matching, splits, QC figures (preprocessing to be added)
 - `run_medsam2.py` – zero-shot MedSAM2 evaluation (later step)
 - `tests/`
 

@@ -14,6 +14,7 @@ EXTRACT_DIR = _p("WAWTACE_EXTRACT_DIR", "data/extracted")
 CACHE_DIR = _p("WAWTACE_CACHE_DIR", "data/cache")
 MODELS_DIR = _p("WAWTACE_MODELS_DIR", "checkpoints")
 OUTPUT_DIR = _p("WAWTACE_OUTPUT_DIR", "results")
+MANIFEST_DIR = _p("WAWTACE_MANIFEST_DIR", "manifests")  # small CSV/JSON files, safe to commit
 MEDSAM2_DIR = _p("MEDSAM2_DIR", "MedSAM2")
 
 SEED = 42
