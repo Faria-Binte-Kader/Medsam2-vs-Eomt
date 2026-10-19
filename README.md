@@ -80,3 +80,31 @@ Per case it audits the HU range after SimpleITK applies the NIfTI scaling (air r
 window, software versions, git commit), and writes `manifests/preprocess_audit.csv`. Volumes failing the audit are flagged and not cached.
 The model-side input (gray to RGB, 512 resize, ImageNet normalisation) is built at inference time by `to_medsam2_input`, and predictions are mapped back
 to the CT's spacing/origin/direction by `restore_to_native` / `write_native_mask`. A cache built with a different window or version is refused.
+
+## MedSAM2 zero-shot, oracle-localization prompted (`run_medsam2.py`)
+This is a **prompted** baseline: the only ground-truth information the model sees is the box prompt. Predictions are never corrected with ground truth.
+```bash
+python run_medsam2.py --split val --dry-run                 # prompts only, no model (writes results/medsam2/val_dryrun/prompts.jsonl)
+python run_medsam2.py --split val --limit 1 --device cuda   # smoke test on one validation volume
+python run_medsam2.py --split val --device cuda --hd95      # development on val
+python run_medsam2.py --split test --device cuda            # final frozen test run (see guard below)
+python run_medsam2.py --split secondary --device cuda       # secondary set, reported separately
+```
+Prompt policy (`config.PROMPT`, fixed before any test run): each lesion = a 26-connected component of an instance mask; key slice = axial slice
+with that lesion's largest GT area; box = tight in-plane extent `[x_min, y_min, x_max, y_max]` (inclusive pixels) on that slice; the box is given on the
+key slice and propagated through the whole volume forward, then in reverse (as upstream `medsam2_infer_3D_CT.py`); each lesion's prediction keeps its largest
+3D component (as upstream); the volume prediction is the union over lesions. Conditions `exact`, `mild`, `strong` pad, translate and jitter the box in
+pixels with a seed derived from (seed, patient, phase, lesion, condition); boxes are clipped to the image, and a box that becomes invalid is logged and
+counts as a missed lesion (Dice 0), not dropped. Tumor-size bins are predeclared (`<10`, `10-50`, `>=50` mL).
+
+Outputs in `results/medsam2/<run>/`: `volume_metrics.csv` (Dice, IoU, volumes, runtime, optional HD95), `lesion_metrics.jsonl`, `prompts.jsonl` (every box, units, seed),
+`patient_summary.csv`, `summary.csv` and `summary_by_size.csv` (per-patient means, then mean/median/std and a seeded bootstrap 95% CI over patients), native-space masks
+(`masks/`), overlays, `config_snapshot.json` (config, versions, git commit). Runs resume; a run directory refuses a different configuration.
+**Test guard:** a full `--split test` run registers its configuration in `results/medsam2/test_registry.json`; later test runs with a changed window, prompt policy or model are
+refused unless `--allow-test-config-change` is given. Debug runs (`--limit`, `--patients`) do not register. Develop on `val`.
+
+## Verification status of the MedSAM2 pipeline
+- Offline unit tests (66): prompt boxes (empty, border-touching), perturbation reproducibility/clipping/invalid handling, lesion components, metrics with known answers, native-space restoration, split disjointness, test-split guard, checkpoint refusal.
+- Runner orchestration is tested with a stub predictor defined only in the tests (never used for results).
+- The real pinned MedSAM2 code and checkpoint (SHA-256 verified) were run on CPU on a *synthetic* volume to check loading, box prompting, forward/reverse propagation and native-grid output. Its Dice is meaningless and is not a result.
+- Not yet run: the pipeline on real WAW-TACE volumes, on GPU (bf16 autocast path), or any reported metric. No real MedSAM2 result exists yet.

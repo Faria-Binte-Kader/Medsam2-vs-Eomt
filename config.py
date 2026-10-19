@@ -79,3 +79,16 @@ HU_AUDIT = {  # heuristic plausibility bounds, used to flag (not silently fix) v
     "hu_min_floor": -3100.0, "hu_max_ceiling": 4100.0,
     "tumor_median_range": (-50.0, 250.0),
 }
+
+# MedSAM2 oracle-localization prompting (see run_medsam2.py). Fixed before any test-set run.
+PROMPT = {
+    "lesion_unit": "connected_component_per_instance",  # 26-connected components of each instance mask
+    "key_slice": "largest_gt_area_slice",               # axial slice where that lesion's GT area is largest
+    "box": "tight in-plane extent of the lesion on the key slice, [x_min, y_min, x_max, y_max], inclusive pixel indices",
+    "propagation": "whole volume, forward then reverse from the key slice (as upstream medsam2_infer_3D_CT.py)",
+    "postprocess": "largest_cc",                        # per-lesion largest 3D component (as upstream); no GT used
+    "aggregation": "union of per-lesion predictions",
+    "box_units": "native in-plane pixels (x = columns, y = rows)",
+}
+SIZE_BINS_ML = (10.0, 50.0)   # predeclared tumor-size bins: <10, 10-50, >=50 mL
+BOOTSTRAP = {"n": 2000, "seed": SEED}
