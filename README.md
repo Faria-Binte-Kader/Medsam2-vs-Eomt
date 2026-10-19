@@ -20,7 +20,7 @@ conda create -n medsam2 python=3.12 -y && conda activate medsam2
 pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
 pip install numpy>=2.0.1 SimpleITK nibabel pandas scipy scikit-image matplotlib requests tqdm pytest hydra-core iopath pillow
 python fetch_medsam2.py            # add --dry-run to preview
-pip install -e MedSAM2             # prefix SAM2_BUILD_CUDA=0 to skip the optional CUDA extension
+pip install --no-build-isolation -e MedSAM2   # compiles the optional CUDA extension against YOUR torch; without --no-build-isolation pip builds against a different torch and `_C.so` fails to load
 python -m pytest -q tests
 
 # EoMT env (later phase; pins to be decided after reading https://github.com/tue-mps/eomt)
@@ -108,3 +108,12 @@ refused unless `--allow-test-config-change` is given. Debug runs (`--limit`, `--
 - Runner orchestration is tested with a stub predictor defined only in the tests (never used for results).
 - The real pinned MedSAM2 code and checkpoint (SHA-256 verified) were run on CPU on a *synthetic* volume to check loading, box prompting, forward/reverse propagation and native-grid output. Its Dice is meaningless and is not a result.
 - Not yet run: the pipeline on real WAW-TACE volumes, on GPU (bf16 autocast path), or any reported metric. No real MedSAM2 result exists yet.
+
+### z-extent modes and the CUDA extension
+`--z-mode unbounded` (default) propagates the key-slice box through the whole volume, as the upstream scripts do. `--z-mode gt_extent` also gives the lesion's
+ground-truth z range, which bounds the propagation itself (`max_frame_num_to_track`), i.e. the oracle prompt is a 3D extent. Both modes are declared up front and
+reported separately (run directories `<split>_<mode>`); the in-plane box and key slice are identical in both. `volume_metrics.csv` has `diag_*` columns
+(prediction volume outside the GT z range, Dice inside it): these use ground truth for analysis only and are never fed back into predictions.
+If a run prints `undefined symbol ... _C.so` and "Skipping the post-processing step", the compiled extension does not match the installed torch and small-hole filling is skipped.
+Rebuild it (`cd MedSAM2 && rm -f sam2/_C.so && pip install --no-build-isolation -e .`, needs a CUDA toolkit matching torch's CUDA version). Whichever way, the state is recorded
+in `config_snapshot.json` (`sam2_cuda_extension`); use one state for every reported run.

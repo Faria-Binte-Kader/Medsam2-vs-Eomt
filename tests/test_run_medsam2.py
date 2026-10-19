@@ -113,7 +113,7 @@ class StubPredictor:
     def reset_state(self, st):
         st["box"] = None
 
-    def propagate_in_video(self, st, reverse=False):
+    def propagate_in_video(self, st, reverse=False, max_frame_num_to_track=None):
         st["calls"].append(reverse)
         k = st["key"]
         frames = range(k, max(k - 3, -1), -1) if reverse else range(k, min(k + 3, st["n"]))
@@ -208,19 +208,19 @@ def test_dry_run_writes_reproducible_prompts_without_a_model(project, monkeypatc
     man, out = project
     monkeypatch.setattr(R, "load_predictor", lambda d: pytest.fail("model must not load in --dry-run"))
     assert run_cli(monkeypatch, man, "--split", "val", "--dry-run") == 0
-    p1 = (out / "medsam2" / "val_dryrun" / "prompts.jsonl").read_text()
+    p1 = (out / "medsam2" / "val_unbounded_dryrun" / "prompts.jsonl").read_text()
     assert len(p1.splitlines()) == 2 * 3  # 2 lesions x 3 conditions
-    import shutil; shutil.rmtree(out / "medsam2" / "val_dryrun")
+    import shutil; shutil.rmtree(out / "medsam2" / "val_unbounded_dryrun")
     run_cli(monkeypatch, man, "--split", "val", "--dry-run")
-    assert (out / "medsam2" / "val_dryrun" / "prompts.jsonl").read_text() == p1
-    snap = json.loads((out / "medsam2" / "val_dryrun" / "config_snapshot.json").read_text())
+    assert (out / "medsam2" / "val_unbounded_dryrun" / "prompts.jsonl").read_text() == p1
+    snap = json.loads((out / "medsam2" / "val_unbounded_dryrun" / "config_snapshot.json").read_text())
     assert snap["oracle_localization"] is True and snap["medsam2"]["checkpoint"] == "MedSAM2_latest.pt"
 
 
 def test_full_stub_run_resume_and_outputs(project, monkeypatch):
     man, out = project
     assert run_cli(monkeypatch, man, "--split", "val", "--no-overlays") == 0
-    d = out / "medsam2" / "val"
+    d = out / "medsam2" / "val_unbounded"
     vol = pd.read_csv(d / "volume_metrics.csv")
     assert len(vol) == 3 and set(vol.condition) == {"exact", "mild", "strong"} and (vol.split == "val").all()
     for f in ("summary.csv", "summary_by_size.csv", "patient_summary.csv", "lesion_metrics.jsonl", "prompts.jsonl", "config_snapshot.json"):
@@ -258,3 +258,55 @@ def test_checkpoint_missing_or_corrupt_is_refused_with_no_fallback(tmp_path, mon
     monkeypatch.setitem(C.MEDSAM2, "size_bytes", 3)
     monkeypatch.setitem(C.MEDSAM2, "sha256", hashlib.sha256(b"abc").hexdigest())
     assert R.verify_checkpoint() == good
+
+
+class LeakyStub(StubPredictor):
+    """Stub that, like an over-propagating model, segments the box on EVERY frame it is asked to track."""
+    def propagate_in_video(self, st, reverse=False, max_frame_num_to_track=None):
+        st["calls"].append(reverse)
+        k, n = st["key"], st["n"]
+        mx = n if max_frame_num_to_track is None else max_frame_num_to_track
+        frames = range(k, max(k - mx, 0) - 1, -1) if reverse else range(k, min(k + mx, n - 1) + 1)
+        for f in frames:
+            m = torch.full((1, 1, st["H"], st["W"]), -5.0)
+            x0, y0, x1, y1 = st["box"]
+            m[0, 0, y0:y1 + 1, x0:x1 + 1] = 5.0
+            yield f, [1], m
+
+
+def test_z_modes_unbounded_leaks_gt_extent_bounds_the_propagation(tmp_path):
+    case = make_case(tmp_path, lesions=((10, 15),))  # one cuboid lesion, z 10..14, same cross-section on every slice
+    conds = {"exact": C.PROMPT_CONDITIONS["exact"]}
+    out = {}
+    for mode in ("unbounded", "gt_extent"):
+        v, _, pr = R.evaluate_case(case, {"eval_set": "primary"}, "val", conds, LeakyStub(), "cpu", tmp_path / mode,
+                                   overlays=False, z_mode=mode)
+        out[mode] = (v[0], pr[0])
+    u, b = out["unbounded"][0], out["gt_extent"][0]
+    assert u["diag_pred_ml_outside_gt_z"] > 0 and u["dice"] < 0.5          # leaks over all 30 slices
+    assert b["diag_pred_ml_outside_gt_z"] == 0 and b["dice"] == pytest.approx(1.0)
+    assert u["diag_dice_within_gt_z"] == pytest.approx(1.0) and u["diag_gt_z_range"] == "10-14"
+    pu, pb = out["unbounded"][1], out["gt_extent"][1]
+    assert pu["propagate_forward_max"] is None and pu["gt_z_range"] == [10, 14] and pu["z_mode"] == "unbounded"
+    assert (pb["propagate_forward_max"], pb["propagate_reverse_max"]) == (4, 0)  # key slice is 10 (first max)
+    # prompts (box, key slice) are identical across z modes: only the propagation range differs
+    assert pu["final_box_xyxy"] == pb["final_box_xyxy"] and pu["key_slice"] == pb["key_slice"]
+
+
+def test_fingerprint_is_independent_of_chosen_z_mode(monkeypatch):
+    a = R.config_fingerprint()
+    monkeypatch.setitem(C.PROMPT, "z_extent", "gt_extent")
+    assert R.config_fingerprint() == a
+    monkeypatch.setattr(C, "Z_MODES", ("unbounded",))
+    assert R.config_fingerprint() != a
+
+
+def test_cli_z_mode_separates_run_dirs_and_is_recorded(project, monkeypatch):
+    man, out = project
+    assert run_cli(monkeypatch, man, "--split", "val", "--z-mode", "gt_extent", "--no-overlays") == 0
+    d = out / "medsam2" / "val_gt_extent"
+    snap = json.loads((d / "config_snapshot.json").read_text())
+    assert snap["z_mode"] == "gt_extent" and "sam2_cuda_extension" in snap["versions"]
+    vol = pd.read_csv(d / "volume_metrics.csv")
+    assert set(vol.z_mode) == {"gt_extent"} and "diag_pred_ml_outside_gt_z" in vol.columns
+    assert not (out / "medsam2" / "val_unbounded").exists()

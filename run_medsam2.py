@@ -6,6 +6,7 @@ seeded and logged. Weights are the pinned genuine MedSAM2 checkpoint; there is n
 
   python run_medsam2.py --split val --limit 1 --device cuda            # smoke test on one validation volume
   python run_medsam2.py --split val --dry-run                          # prompts only, no model
+  python run_medsam2.py --split val --z-mode gt_extent --device cuda   # bound propagation by the GT z range
   python run_medsam2.py --split test --device cuda                     # final frozen test run (guarded)
   python run_medsam2.py --split secondary --device cuda                # separately reported secondary set
 """
@@ -89,17 +90,23 @@ def box_iou(a, b):
     return inter / (area(a) + area(b) - inter)
 
 
-def build_prompts(lesions, patient, phase, conditions, H, W):
+def build_prompts(lesions, patient, phase, conditions, H, W, z_mode="unbounded"):
     """One record per (lesion, condition). GT enters only through each lesion's key slice and exact box."""
     recs = []
     for li, les in enumerate(lesions):
         z, exact, area = key_slice_and_box(les["mask"])
+        zs = np.nonzero(les["mask"].any((1, 2)))[0]
+        zr = [int(zs.min()), int(zs.max())]
+        bounded = z_mode == "gt_extent"
         for cname, params in conditions.items():
             ci = list(C.PROMPT_CONDITIONS).index(cname)  # global index, so resumed/partial runs draw identical boxes
             entropy = [C.SEED, patient, phase, li, ci]
             pr = perturb_box(exact, params, make_rng(*entropy), H, W)
             recs.append({"patient_id": patient, "phase": phase, "lesion_id": les["lesion_id"], "lesion_index": li,
                          "condition": cname, "condition_params": params, "key_slice": z, "gt_area_px_on_key_slice": area,
+                         "gt_z_range": zr, "z_mode": z_mode,
+                         "propagate_forward_max": zr[1] - z if bounded else None,
+                         "propagate_reverse_max": z - zr[0] if bounded else None,
                          "exact_box_xyxy": exact, "final_box_xyxy": pr["box"], "box_before_clip": pr["box_before_clip"],
                          "clipped": pr["clipped"], "valid": pr["valid"], "invalid_reason": pr["reason"],
                          "translate_xy": pr["translate_xy"], "jitter": pr["jitter"],
@@ -147,10 +154,11 @@ def load_predictor(device):
     return build_sam2_video_predictor_npz(C.MEDSAM2["model_cfg"], str(ckpt), device=device)
 
 
-def propagate_lesion(predictor, images, H, W, key, box, device):
+def propagate_lesion(predictor, images, H, W, key, box, device, z_range=None):
     """Box on `key`, propagate forward, reset, same box again, propagate in reverse: upstream semantics.
 
-    Returns a bool array (z, H, W) at the native slice size (the predictor resizes outputs back to H, W).
+    With z_range=(z_min, z_max) the propagation itself is bounded (max_frame_num_to_track forward = z_max - key,
+    reverse = key - z_min). Returns a bool array (z, H, W) at the native slice size (the predictor resizes to H, W).
     """
     import torch
     seg = np.zeros((images.shape[0], H, W), dtype=bool)
@@ -160,7 +168,8 @@ def propagate_lesion(predictor, images, H, W, key, box, device):
         for reverse in (False, True):
             predictor.add_new_points_or_box(inference_state=state, frame_idx=key, obj_id=1,
                                             box=np.array(box, dtype=np.float32))
-            for idx, _ids, logits in predictor.propagate_in_video(state, reverse=reverse):
+            kw = {} if z_range is None else {"max_frame_num_to_track": (key - z_range[0]) if reverse else (z_range[1] - key)}
+            for idx, _ids, logits in predictor.propagate_in_video(state, reverse=reverse, **kw):
                 seg[idx] |= (logits[0] > 0.0).cpu().numpy()[0]
             predictor.reset_state(state)
     return seg
@@ -175,7 +184,7 @@ def largest_cc(seg):
 
 # ----------------------------------------------------------------------------- evaluation of one case
 def evaluate_case(case, row, split, conditions, predictor, device, out_dir, hd95=False, overlays=True,
-                  propagate=propagate_lesion):
+                  propagate=propagate_lesion, z_mode="unbounded"):
     """Run every condition on one cached case. Returns (volume rows, lesion rows, prompt records)."""
     meta, gt = case["meta"], case["mask_union"] > 0
     geom = meta["geometry"]
@@ -186,7 +195,7 @@ def evaluate_case(case, row, split, conditions, predictor, device, out_dir, hd95
     for les in lesions:
         covered |= les["mask"]
     assert (covered == gt).all(), "lesion components do not reproduce the union ground truth"
-    prompts = build_prompts(lesions, patient, phase, conditions, H, W)
+    prompts = build_prompts(lesions, patient, phase, conditions, H, W, z_mode)
     images = None
     if predictor is not None:
         import torch
@@ -206,7 +215,8 @@ def evaluate_case(case, row, split, conditions, predictor, device, out_dir, hd95
                 continue
             if predictor is None:
                 continue
-            seg = largest_cc(propagate(predictor, images, H, W, pr["key_slice"], pr["final_box_xyxy"], device))
+            zr = tuple(pr["gt_z_range"]) if z_mode == "gt_extent" else None
+            seg = largest_cc(propagate(predictor, images, H, W, pr["key_slice"], pr["final_box_xyxy"], device, z_range=zr))
             pred |= seg
             rec.update(dice=M.dice(seg, les["mask"]), pred_volume_ml=M.volume_ml(seg, geom["spacing_xyz"]))
             les_rows.append(rec)
@@ -220,13 +230,19 @@ def evaluate_case(case, row, split, conditions, predictor, device, out_dir, hd95
         mpath = Path(out_dir) / "masks" / row["eval_set"] / f"p{patient}_ph{phase}" / f"{cname}.nii.gz"
         P.write_native_mask(pred_native, geom, mpath)
         gt_ml = M.volume_ml(gt, geom["spacing_xyz"])
+        zs = np.nonzero(gt.any((1, 2)))[0]  # DIAGNOSTICS ONLY (use GT, never fed back into the prediction)
+        zlo, zhi = int(zs.min()), int(zs.max())
+        outside = pred_native.copy()
+        outside[zlo:zhi + 1] = False
         vol_rows.append({
             "patient_id": patient, "phase": phase, "phase_name": meta["phase_name"], "eval_set": row["eval_set"],
-            "split": split, "condition": cname, "n_lesions": len(lesions), "n_invalid_prompts": n_inv,
+            "split": split, "z_mode": z_mode, "condition": cname, "n_lesions": len(lesions), "n_invalid_prompts": n_inv,
             "gt_volume_ml": gt_ml, "pred_volume_ml": M.volume_ml(pred_native, geom["spacing_xyz"]),
             "size_bin": M.size_bin(gt_ml, C.SIZE_BINS_ML), "dice": M.dice(pred_native, gt), "iou": M.iou(pred_native, gt),
             "hd95_mm": M.hd95(pred_native, gt, geom["spacing_xyz"]) if hd95 else float("nan"),
-            "runtime_s": runtime, "n_slices": Z, "mask_path": str(mpath)})
+            "diag_pred_ml_outside_gt_z": M.volume_ml(outside, geom["spacing_xyz"]),
+            "diag_dice_within_gt_z": M.dice(pred_native[zlo:zhi + 1], gt[zlo:zhi + 1]),
+            "diag_gt_z_range": f"{zlo}-{zhi}", "runtime_s": runtime, "n_slices": Z, "mask_path": str(mpath)})
         if overlays:
             save_overlay(case, pred_native, [p for p in prompts if p["condition"] == cname],
                          Path(out_dir) / "overlays" / f"p{patient}_ph{phase}_{cname}.png", vol_rows[-1])
@@ -260,8 +276,10 @@ def save_overlay(case, pred, prompts, path, vrow):
 
 # ----------------------------------------------------------------------------- run management
 def config_fingerprint():
-    blob = {"window": C.HU_WINDOW, "conditions": C.PROMPT_CONDITIONS, "prompt": C.PROMPT, "medsam2": C.MEDSAM2, "seed": C.SEED,
-            "preprocess": C.PREPROCESS_VERSION, "size_bins": C.SIZE_BINS_ML}
+    # z_mode is chosen per run and recorded in the snapshot; the set of allowed modes is part of the frozen design
+    blob = {"window": C.HU_WINDOW, "conditions": C.PROMPT_CONDITIONS,
+            "prompt": {k: v for k, v in C.PROMPT.items() if k != "z_extent"}, "z_modes": C.Z_MODES,
+            "medsam2": C.MEDSAM2, "seed": C.SEED, "preprocess": C.PREPROCESS_VERSION, "size_bins": C.SIZE_BINS_ML}
     return hashlib.sha256(json.dumps(blob, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -295,7 +313,7 @@ def guard_test_split(args, fp, run_dir):
         sys.exit(f"Test split was already evaluated with configuration(s) {sorted(runs)}; current is {fp}. "
                  "Changing prompt policy, window or model after seeing test results is not allowed. Use "
                  "--allow-test-config-change only for a documented, intentional rerun.")
-    runs.setdefault(fp, []).append({"run_dir": str(run_dir), "time": time.strftime("%Y-%m-%d %H:%M:%S")})
+    runs.setdefault(fp, []).append({"run_dir": str(run_dir), "z_mode": args.z_mode, "time": time.strftime("%Y-%m-%d %H:%M:%S")})
     reg.parent.mkdir(parents=True, exist_ok=True)
     reg.write_text(json.dumps(runs, indent=1))
 
@@ -308,6 +326,11 @@ def versions():
             out[pkg] = md.version(pkg)
         except md.PackageNotFoundError:
             out[pkg] = None
+    try:
+        from sam2 import _C  # noqa: F401  (optional compiled extension used for hole filling)
+        out["sam2_cuda_extension"] = "loaded"
+    except Exception as e:
+        out["sam2_cuda_extension"] = f"NOT loaded ({type(e).__name__}): small-hole filling post-processing is skipped"
     return out
 
 
@@ -318,6 +341,8 @@ def main():
     ap.add_argument("--device", default=C.DEVICE, choices=["cuda", "cpu", "auto"])
     ap.add_argument("--patients", type=int, nargs="+")
     ap.add_argument("--limit", type=int, help="debug: first N cases of the split")
+    ap.add_argument("--z-mode", choices=list(C.Z_MODES), default=C.PROMPT["z_extent"],
+                    help="unbounded: propagate through the whole volume; gt_extent: bound propagation by the lesion's GT z range")
     ap.add_argument("--hd95", action="store_true", help="also compute HD95 (mm); slower")
     ap.add_argument("--no-overlays", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="derive and write prompts only; no model, no predictions")
@@ -335,7 +360,7 @@ def main():
         sys.exit("no cases selected")
     conditions = {k: C.PROMPT_CONDITIONS[k] for k in args.conditions}
     debug = bool(args.limit or args.patients)
-    name = args.run_name or (args.split + ("_debug" if debug else "") + ("_dryrun" if args.dry_run else ""))
+    name = args.run_name or (f"{args.split}_{args.z_mode}" + ("_debug" if debug else "") + ("_dryrun" if args.dry_run else ""))
     run_dir = C.OUTPUT_DIR / "medsam2" / name
     run_dir.mkdir(parents=True, exist_ok=True)
     fp = config_fingerprint()
@@ -350,10 +375,13 @@ def main():
 
     device = None if args.dry_run else resolve_device(args.device)
     predictor = None if args.dry_run else load_predictor(device)
+    ver = versions()
+    if "NOT loaded" in str(ver.get("sam2_cuda_extension")):
+        print(f"WARNING: sam2 CUDA extension {ver['sam2_cuda_extension']}. Rebuild it (README) so all runs use the same post-processing.")
     snap.write_text(json.dumps({
-        "fingerprint": fp, "command": sys.argv, "split": args.split, "n_cases": len(todo), "conditions": conditions,
+        "fingerprint": fp, "z_mode": args.z_mode, "command": sys.argv, "split": args.split, "n_cases": len(todo), "conditions": conditions,
         "window_hu": C.HU_WINDOW, "prompt_policy": C.PROMPT, "medsam2": C.MEDSAM2, "seed": C.SEED, "device": device,
-        "versions": versions(), "git_commit": P._git_head(), "oracle_localization": True,
+        "versions": ver, "git_commit": P._git_head(), "oracle_localization": True,
         "note": "Prompted baseline: boxes derive from ground-truth masks; not a fully automatic result."}, indent=1, default=str))
 
     vpath, lpath, ppath = run_dir / "volume_metrics.csv", run_dir / "lesion_metrics.jsonl", run_dir / "prompts.jsonl"
@@ -371,7 +399,7 @@ def main():
         try:
             case = P.load_case(P.case_dir(row))
             vrows, lrows, prompts = evaluate_case(case, row, args.split, conds, predictor, device, run_dir,
-                                                  hd95=args.hd95, overlays=not args.no_overlays)
+                                                  hd95=args.hd95, overlays=not args.no_overlays, z_mode=args.z_mode)
         except Exception as e:  # keep a long job alive; failures are reported and counted
             failures.append({"patient_id": p, "phase": ph, "error": f"{type(e).__name__}: {e}"})
             print(f"[{i}/{len(todo)}] p{p} phase {ph}: FAILED {type(e).__name__}: {e}")

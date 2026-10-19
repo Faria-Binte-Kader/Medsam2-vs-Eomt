@@ -85,10 +85,16 @@ PROMPT = {
     "lesion_unit": "connected_component_per_instance",  # 26-connected components of each instance mask
     "key_slice": "largest_gt_area_slice",               # axial slice where that lesion's GT area is largest
     "box": "tight in-plane extent of the lesion on the key slice, [x_min, y_min, x_max, y_max], inclusive pixel indices",
-    "propagation": "whole volume, forward then reverse from the key slice (as upstream medsam2_infer_3D_CT.py)",
+    "propagation": "box on the key slice, forward then reverse (as upstream medsam2_infer_3D_CT.py); z range per z_extent",
+    "z_extent": "unbounded",  # default z mode, see Z_MODES
     "postprocess": "largest_cc",                        # per-lesion largest 3D component (as upstream); no GT used
     "aggregation": "union of per-lesion predictions",
     "box_units": "native in-plane pixels (x = columns, y = rows)",
 }
+# z_extent modes. "unbounded": propagate through the whole volume (upstream-literal; the model decides where the lesion ends).
+# "gt_extent": the lesion's ground-truth z range (first/last slice containing it) bounds the propagation itself via the
+# predictor's max_frame_num_to_track, i.e. the oracle prompt is a 3D extent (key-slice box + z range). Both modes are
+# declared up front and reported separately; neither is chosen from test results.
+Z_MODES = ("unbounded", "gt_extent")
 SIZE_BINS_ML = (10.0, 50.0)   # predeclared tumor-size bins: <10, 10-50, >=50 mL
 BOOTSTRAP = {"n": 2000, "seed": SEED}
