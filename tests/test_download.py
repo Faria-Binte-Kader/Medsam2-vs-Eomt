@@ -120,3 +120,11 @@ def test_safe_extract_selective_and_blocks_traversal(tmp_path):
         D.safe_extract(evil, tmp_path / "out2")
     assert not (tmp_path / "escape.txt").exists()
     assert [m[0] for m in D.list_members(z)] == ["p1/a.txt", "p2/b.txt"]
+
+
+def test_list_missing_archive_gives_clear_error(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setattr(D.C, "RAW_DIR", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["download_data.py", "--list", "nope.zip"])
+    with pytest.raises(D.DownloadError, match="not found"):
+        D.main()

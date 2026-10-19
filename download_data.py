@@ -163,7 +163,14 @@ def main():
     a = ap.parse_args()
 
     if a.list or a.extract:
-        z = C.RAW_DIR / (a.list or a.extract)
+        arg = Path(a.list or a.extract)
+        z = arg if arg.is_absolute() or arg.exists() else C.RAW_DIR / arg
+        if not z.is_file():
+            raise DownloadError(f"{z} not found. Download it first, or set WAWTACE_RAW_DIR to the "
+                                f"directory holding it (currently {C.RAW_DIR}), or pass a full path.")
+        if not zipfile.is_zipfile(z):
+            raise DownloadError(f"{z} is not a valid ZIP (incomplete download? check for a .part file "
+                                f"and re-run the download)")
         if a.list:
             for name, size in list_members(z):
                 print(f"{size:>14,}  {name}")
