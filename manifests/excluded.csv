@@ -121,23 +121,11 @@ patient_id,phase,item,reason,detail
 540.0,2.0,1 mask file(s),ct_not_in_downloaded_archive,mask has no CT of the same patient+phase in the configured CT archives (not an error)
 543.0,1.0,1 mask file(s),ct_not_in_downloaded_archive,mask has no CT of the same patient+phase in the configured CT archives (not an error)
 7.0,1.0,tumor_masks_wawtace_v1_08_05_2024/7/7_1_2_tumor_seg.nrrd,duplicate_instance,identical bytes (CRC32+size) to instance 1; dropped
-24.0,2.0,tumor_masks_wawtace_v1_08_05_2024/24/24_2_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 241] vs [512, 512, 263]; origin_xyz differs"
-26.0,1.0,tumor_masks_wawtace_v1_08_05_2024/26/26_1_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 316] vs [512, 512, 309]; spacing_xyz differs; origin_xyz differs"
 27.0,1.0,tumor_masks_wawtace_v1_08_05_2024/27/27_1_1_tumor_seg.nrrd,mask_grid_mismatch,"size [788, 70, 628] vs [512, 512, 283]; spacing_xyz differs; origin_xyz differs"
 27.0,1.0,tumor_masks_wawtace_v1_08_05_2024/27/27_1_2_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 282] vs [512, 512, 283]; origin_xyz differs"
 31.0,2.0,tumor_masks_wawtace_v1_08_05_2024/31/31_2_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 481] vs [512, 512, 49]; spacing_xyz differs"
-44.0,1.0,tumor_masks_wawtace_v1_08_05_2024/44/44_1_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 177] vs [512, 512, 195]; spacing_xyz differs; origin_xyz differs"
-53.0,1.0,tumor_masks_wawtace_v1_08_05_2024/53/53_1_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 292] vs [512, 512, 268]; origin_xyz differs"
 65.0,2.0,tumor_masks_wawtace_v1_08_05_2024/65/65_2_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 419] vs [512, 512, 280]; spacing_xyz differs; origin_xyz differs"
 65.0,2.0,tumor_masks_wawtace_v1_08_05_2024/65/65_2_1_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 419] vs [512, 512, 280]; spacing_xyz differs; origin_xyz differs"
 65.0,2.0,tumor_masks_wawtace_v1_08_05_2024/65/65_2_2_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 420] vs [512, 512, 280]; spacing_xyz differs; origin_xyz differs"
-72.0,1.0,tumor_masks_wawtace_v1_08_05_2024/72/72_1_0_tumor_seg.nrrd,unexpected_mask_labels,"[0, 2]"
-84.0,1.0,tumor_masks_wawtace_v1_08_05_2024/84/84_1_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 148] vs [512, 512, 159]; spacing_xyz differs; origin_xyz differs"
-86.0,2.0,tumor_masks_wawtace_v1_08_05_2024/86/86_2_0_tumor_seg.nrrd,mask_grid_mismatch,origin_xyz differs
 88.0,2.0,tumor_masks_wawtace_v1_08_05_2024/88/88_2_1_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 187] vs [512, 512, 184]; spacing_xyz differs; origin_xyz differs"
-92.0,1.0,tumor_masks_wawtace_v1_08_05_2024/92/92_1_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 150] vs [512, 512, 161]; spacing_xyz differs; origin_xyz differs"
-96.0,1.0,tumor_masks_wawtace_v1_08_05_2024/96/96_1_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 180] vs [512, 512, 205]; spacing_xyz differs; origin_xyz differs"
-99.0,3.0,tumor_masks_wawtace_v1_08_05_2024/99/99_3_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 235] vs [512, 512, 118]; spacing_xyz differs"
-119.0,1.0,tumor_masks_wawtace_v1_08_05_2024/119/119_1_2_tumor_seg.nrrd,unexpected_mask_labels,"[0, 2]"
 121.0,1.0,tumor_masks_wawtace_v1_08_05_2024/121/121_1_0_tumor_seg.nrrd,unexpected_mask_labels,"[0, 1, 2]"
-158.0,2.0,tumor_masks_wawtace_v1_08_05_2024/158/158_2_0_tumor_seg.nrrd,mask_grid_mismatch,"size [512, 512, 109] vs [512, 512, 261]; spacing_xyz differs; origin_xyz differs"
