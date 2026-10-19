@@ -249,28 +249,50 @@ def evaluate_case(case, row, split, conditions, predictor, device, out_dir, hd95
     return vol_rows, les_rows, prompts
 
 
-def save_overlay(case, pred, prompts, path, vrow):
+def save_overlay(case, pred, prompts, path, vrow, max_panels=8):
+    """Montage across the lesion: key slice + evenly spaced slices over the union of GT and predicted z ranges.
+
+    green = ground truth, red = prediction, yellow = prompt box (key slice). Titles carry the per-slice Dice and flag
+    slices outside the GT z range (where any prediction is leakage). Review aid only.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     gt = case["mask_union"] > 0
     big = max(prompts, key=lambda p: p["gt_area_px_on_key_slice"])
-    z = big["key_slice"]
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.imshow(case["ct_u8"][z], cmap="gray", vmin=0, vmax=255)
-    ax.contour(gt[z], levels=[0.5], colors="lime", linewidths=1)
-    if pred[z].any():
-        ax.contour(pred[z], levels=[0.5], colors="red", linewidths=1)
-    b = big["final_box_xyxy"]
-    ax.add_patch(plt.Rectangle((b[0], b[1]), b[2] - b[0], b[3] - b[1], fill=False, edgecolor="yellow", lw=1.2))
-    ys, xs = np.nonzero(gt[z])
-    ax.set_xlim(max(xs.min() - 60, 0), min(xs.max() + 60, gt.shape[2]))
-    ax.set_ylim(min(ys.max() + 60, gt.shape[1]), max(ys.min() - 60, 0))
-    ax.set_title(f"p{vrow['patient_id']} {vrow['condition']} z={z} Dice={vrow['dice']:.3f}\n"
-                 "green=GT red=pred yellow=prompt box", fontsize=8)
-    ax.axis("off")
+    key = big["key_slice"]
+    zg = np.nonzero(gt.any((1, 2)))[0]
+    zp = np.nonzero(pred.any((1, 2)))[0]
+    lo, hi = int(min(zg.min(), zp.min() if len(zp) else zg.min())), int(max(zg.max(), zp.max() if len(zp) else zg.max()))
+    picks = sorted({key, *np.linspace(lo, hi, max_panels - 1).round().astype(int).tolist()})
+    picks = picks[:max_panels] if len(picks) <= max_panels else sorted({key, *picks[::2]})[:max_panels]
+    ys, xs = np.nonzero(gt.any(0) | pred.any(0))
+    y0, y1 = max(ys.min() - 30, 0), min(ys.max() + 30, gt.shape[1])
+    x0, x1 = max(xs.min() - 30, 0), min(xs.max() + 30, gt.shape[2])
+    cols = 4
+    fig, axes = plt.subplots((len(picks) + cols - 1) // cols, cols, figsize=(4 * cols, 4 * ((len(picks) + cols - 1) // cols)))
+    axes = np.atleast_1d(axes).ravel()
+    for ax, z in zip(axes, picks):
+        ax.imshow(case["ct_u8"][z][y0:y1, x0:x1], cmap="gray", vmin=0, vmax=255, extent=(x0, x1, y1, y0))
+        if gt[z].any():
+            ax.contour(np.arange(x0, x1), np.arange(y0, y1), gt[z][y0:y1, x0:x1], levels=[0.5], colors="lime", linewidths=1)
+        if pred[z].any():
+            ax.contour(np.arange(x0, x1), np.arange(y0, y1), pred[z][y0:y1, x0:x1], levels=[0.5], colors="red", linewidths=1)
+        if z == key:
+            b = big["final_box_xyxy"]
+            ax.add_patch(plt.Rectangle((b[0], b[1]), b[2] - b[0], b[3] - b[1], fill=False, edgecolor="yellow", lw=1.2))
+        d = M.dice(pred[z], gt[z])
+        tag = ("KEY " if z == key else "") + ("OUTSIDE GT z " if z < zg.min() or z > zg.max() else "")
+        ax.set_title(f"z={z} {tag}slice Dice={'n/a' if np.isnan(d) else f'{d:.2f}'}", fontsize=8)
+        ax.axis("off")
+    for ax in axes[len(picks):]:
+        ax.axis("off")
+    fig.suptitle(f"p{vrow['patient_id']} {vrow['condition']} {vrow.get('z_mode', '')}  3D Dice={vrow['dice']:.3f}  "
+                 f"GT z {zg.min()}-{zg.max()}, pred z {zp.min() if len(zp) else '-'}-{zp.max() if len(zp) else '-'}  "
+                 "(green=GT red=pred yellow=box)", fontsize=9)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=90, bbox_inches="tight")
+    fig.tight_layout()
+    fig.savefig(path, dpi=80)
     plt.close(fig)
 
 
@@ -411,8 +433,11 @@ def main():
             continue
         _append_jsonl(lpath, lrows)
         _append_csv(vpath, pd.DataFrame(vrows))
-        print(f"[{i}/{len(todo)}] p{p} {row.phase_name}: " + ", ".join(
-            f"{r['condition']} dice={r['dice']:.3f} ({r['runtime_s']:.0f}s)" for r in vrows))
+        for r in vrows:
+            print(f"[{i}/{len(todo)}] p{p} {row.phase_name} {r['condition']}: dice={r['dice']:.3f} "
+                  f"pred/gt mL={r['pred_volume_ml']:.0f}/{r['gt_volume_ml']:.0f} "
+                  f"pred outside GT z={r['diag_pred_ml_outside_gt_z']:.0f} mL, dice within GT z={r['diag_dice_within_gt_z']:.3f} "
+                  f"({r['runtime_s']:.0f}s)")
     if failures:
         (run_dir / "failures.json").write_text(json.dumps(failures, indent=1))
         print(f"{len(failures)} case(s) failed; see {run_dir / 'failures.json'}")
