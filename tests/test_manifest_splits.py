@@ -129,3 +129,40 @@ def test_splits_disjoint_deterministic_nested():
 def test_splits_small_cohort_reduces_subsets_and_documents():
     s = P.make_splits(range(10), seed=1)
     assert "20" not in s["train_subsets"] and any("skipped" in n for n in s["notes"])
+
+
+def test_count_components():
+    a = np.zeros((6, 10, 10), np.uint8)
+    a[1:3, 1:3, 1:3] = 1
+    assert P.count_components(a) == (1, 1.0)
+    a[4:6, 6:9, 6:9] = 1  # second, larger blob
+    n, frac = P.count_components(a)
+    assert n == 2 and abs(frac - 18 / 26) < 1e-9
+    assert P.count_components(np.zeros_like(a)) == (0, 0.0)
+
+
+def test_resample_mask_to_ct_moves_by_physical_shift(tmp_path):
+    ct = sitk.GetImageFromArray(np.zeros((6, 16, 20), np.int16))
+    ct.SetSpacing((1.0, 1.0, 2.0)); ct.SetOrigin((0.0, 0.0, 0.0))
+    m = np.zeros((6, 16, 20), np.uint8); m[2:4, 4:8, 4:8] = 1
+    mi = sitk.GetImageFromArray(m)
+    mi.SetSpacing((1.0, 1.0, 2.0)); mi.SetOrigin((3.0, 0.0, 0.0))  # mask grid shifted +3 mm in x
+    res = sitk.GetArrayFromImage(P.resample_mask_to_ct(mi, ct))
+    assert res.sum() == m.sum() and res[2:4, 4:8, 7:11].all()  # box moved 3 voxels, none lost
+    assert set(np.unique(res)) <= {0, 1}  # nearest neighbour: no new label values
+
+
+def test_diagnose_cli_on_synthetic_archives(archives, monkeypatch):
+    import types
+    raw, ext = archives
+    monkeypatch.setattr(P.C, "RAW_DIR", raw)
+    monkeypatch.setattr(P.C, "EXTRACT_DIR", ext)
+    monkeypatch.setattr(P.C, "CT_ARCHIVES", ["ct_scans_1_4_wawtace_09_05_24.zip", "ct_scans_2_4_wawtace_09_05_24.zip"])
+    out = ext.parent / "man"
+    P.cmd_manifest(types.SimpleNamespace(out_dir=str(out), patients=None))
+    P.cmd_diagnose(types.SimpleNamespace(out_dir=str(out)))
+    d = pd.read_csv(out / "diagnose_unusable.csv")
+    assert list(d.patient_id) == [2] and not d.grid_matches_filename_phase.iloc[0]
+    assert 0.9 < d.volume_ratio.iloc[0] <= 1.0  # shifted mask still falls inside the CT
+    comp = pd.read_csv(out / "diagnose_components.csv")
+    assert comp.n_components.max() >= 1 and (out / "diagnose_cases.png").exists()

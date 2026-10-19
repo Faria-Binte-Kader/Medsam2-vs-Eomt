@@ -5,6 +5,7 @@
   python process_data.py manifest                   # inventory.csv + excluded.csv (matching, geometry checks)
   python process_data.py splits                     # splits.json/csv + nested train subsets
   python process_data.py qc --n 12                  # overlay + summary figures
+  python process_data.py diagnose                   # read-only: why annotated cases were excluded; lesion components
 
 File-name conventions below were read from the real archive listings:
   CT   <p>/<p>_<phase>_scan.nii.gz
@@ -459,6 +460,139 @@ def cmd_qc(a):
     print(f"wrote {out}/qc_overlays.png and qc_summary.png")
 
 
+# ----------------------------------------------------------------------------- diagnostics (read-only)
+def header_from_row(r):
+    return {"size_xyz": [int(r.size_x), int(r.size_y), int(r.size_z)],
+            "spacing_xyz": [r.spacing_x, r.spacing_y, r.spacing_z],
+            "origin_xyz": [r.origin_x, r.origin_y, r.origin_z], "direction": json.loads(r.direction)}
+
+
+def resample_mask_to_ct(mask_img, ct_img):
+    """Nearest-neighbour resample of a mask into the CT grid through physical space (identity transform)."""
+    import SimpleITK as sitk
+    return sitk.Resample(mask_img, ct_img, sitk.Transform(), sitk.sitkNearestNeighbor, 0, mask_img.GetPixelID())
+
+
+def count_components(binary):
+    """Number of 26-connected components of a 3D binary array and the fraction of voxels in the largest."""
+    from scipy import ndimage
+    lab, n = ndimage.label(binary > 0, structure=np.ones((3, 3, 3)))
+    if n == 0:
+        return 0, 0.0
+    sizes = np.bincount(lab.ravel())[1:]
+    return int(n), float(sizes.max() / sizes.sum())
+
+
+def cmd_diagnose(a):
+    """Explain WHY annotated cases were excluded (read-only; the inventory is never modified)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import SimpleITK as sitk
+    import download_data as D
+    out = Path(a.out_dir)
+    inv = pd.read_csv(out / "inventory.csv")
+    mask_zip = C.RAW_DIR / "tumor_masks_wawtace_v1_08_05_2024.zip"
+    masks, _ = parse_archive_names(mask_zip, parse_mask_name)
+    by_key = defaultdict(list)
+    for e in masks:
+        by_key[(e["patient"], e["phase"])].append(e)
+
+    # 1) connected components of every USABLE instance (matters for per-lesion box prompts)
+    comp_rows = []
+    for r in inv[inv.usable].itertuples():
+        for m in json.loads(r.mask_members):
+            n, frac = count_components(mask_array(C.EXTRACT_DIR / m))
+            comp_rows.append({"patient_id": r.patient_id, "phase": r.phase, "mask_member": m,
+                              "n_components": n, "largest_component_fraction": round(frac, 4)})
+    comp = pd.DataFrame(comp_rows)
+    comp.to_csv(out / "diagnose_components.csv", index=False)
+    multi = comp[comp.n_components > 1]
+    print(f"usable instances: {len(comp)}; with >1 connected component: {len(multi)}; "
+          f"components per instance: {dict(comp.n_components.value_counts().sort_index())}")
+
+    # 2) every annotated-but-unusable case
+    bad = inv[(inv.n_mask_files > 0) & (~inv.usable)]
+    rows, panels = [], []
+    for r in bad.itertuples():
+        ct_hdr = header_from_row(r)
+        siblings = inv[inv.patient_id == r.patient_id]
+        for e in by_key[(r.patient_id, r.phase)]:
+            D.safe_extract(mask_zip, C.EXTRACT_DIR, e["member"])
+            path = C.EXTRACT_DIR / e["member"]
+            mimg = sitk.ReadImage(str(path))
+            arr = sitk.GetArrayFromImage(mimg)
+            vals, cnts = np.unique(arr, return_counts=True)
+            h = header(path)
+            same_phase, why = same_grid(h, ct_hdr)
+            matches = [int(s.phase) for s in siblings.itertuples() if same_grid(h, header_from_row(s))[0]]
+            row = {"patient_id": r.patient_id, "phase": r.phase, "mask_member": e["member"],
+                   "labels": json.dumps({int(v): int(c) for v, c in zip(vals, cnts)}),
+                   "grid_matches_filename_phase": same_phase, "grid_matches_any_phase_of_patient": json.dumps(matches),
+                   "grid_diff": "; ".join(why), "mask_size_xyz": json.dumps(h["size_xyz"]),
+                   "ct_size_xyz": json.dumps(ct_hdr["size_xyz"]), "mask_spacing_xyz": json.dumps(np.round(h["spacing_xyz"], 4).tolist()),
+                   "ct_spacing_xyz": json.dumps(np.round(ct_hdr["spacing_xyz"], 4).tolist())}
+            plot = None
+            if not same_phase:
+                res = sitk.GetArrayFromImage(resample_mask_to_ct(mimg, _ct_ref(r, D)))
+                v0 = float((arr > 0).sum()) * float(np.prod(h["spacing_xyz"])) / 1000
+                v1 = float((res > 0).sum()) * float(np.prod(ct_hdr["spacing_xyz"])) / 1000
+                row.update(mask_volume_ml=round(v0, 2), resampled_volume_ml=round(v1, 2),
+                           volume_ratio=round(v1 / v0, 3) if v0 else None)
+                plot = ("resampled", res)
+            elif set(np.unique(arr).tolist()) - {0, 1}:
+                plot = ("labels", arr)
+            rows.append(row)
+            if plot:
+                panels.append((r, e, plot))
+    pd.DataFrame(rows).to_csv(out / "diagnose_unusable.csv", index=False)
+    print(pd.DataFrame(rows)[["patient_id", "phase", "labels", "grid_matches_filename_phase",
+                              "grid_matches_any_phase_of_patient"]].to_string(index=False))
+
+    # figure: one panel per mask file, on its own phase CT
+    cols = 4
+    nrows = max((len(panels) + cols - 1) // cols, 1)
+    fig, axes = plt.subplots(nrows, cols, figsize=(4 * cols, 4 * nrows))
+    axes = np.atleast_1d(axes).ravel()
+    lo, hi = C.HU_WINDOW
+    last_key, ct = None, None
+    for ax, (r, e, (kind, arr)) in zip(axes, panels):
+        if last_key != r.ct_member:
+            ct = sitk.GetArrayFromImage(_ct_ref(r, D))
+            last_key = r.ct_member
+        pos = arr > 0
+        z = int(np.argmax(pos.sum((1, 2)))) if pos.any() else ct.shape[0] // 2
+        ax.imshow(np.clip(ct[z], lo, hi), cmap="gray", vmin=lo, vmax=hi)
+        if kind == "labels":
+            ax.contour(arr[z] == 1, levels=[0.5], colors="red", linewidths=0.8)
+            ax.contour(arr[z] == 2, levels=[0.5], colors="cyan", linewidths=0.8)
+            ttl = "red=1 cyan=2"
+        else:
+            ax.contour(arr[z] > 0, levels=[0.5], colors="yellow", linewidths=0.8)
+            ttl = "mask resampled to CT grid"
+        if pos.any():
+            ys, xs = np.nonzero(pos[z])
+            ax.set_xlim(max(xs.min() - 40, 0), min(xs.max() + 40, ct.shape[2]))
+            ax.set_ylim(min(ys.max() + 40, ct.shape[1]), max(ys.min() - 40, 0))
+        ax.set_title(f"p{r.patient_id} {r.phase_name} inst{e['instance']} z={z}\n{ttl}", fontsize=8)
+        ax.axis("off")
+    for ax in axes[len(panels):]:
+        ax.axis("off")
+    fig.tight_layout()
+    fig.savefig(out / "diagnose_cases.png", dpi=100)
+    print(f"wrote diagnose_components.csv, diagnose_unusable.csv, diagnose_cases.png in {out}")
+
+
+def _ct_ref(r, D):
+    import SimpleITK as sitk
+    D.safe_extract(C.RAW_DIR / r.ct_archive, C.EXTRACT_DIR, r.ct_member)
+    path = C.EXTRACT_DIR / r.ct_member
+    img = sitk.ReadImage(str(path))
+    path.unlink()
+    return img
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -467,7 +601,7 @@ if __name__ == "__main__":
     s.add_argument("--patients", type=int, nargs="+", default=[10, 13])
     s.add_argument("--out", default=str(C.OUTPUT_DIR / "inspect_report.json"))
     s.set_defaults(fn=cmd_inspect)
-    for name, fn in (("manifest", cmd_manifest), ("splits", cmd_splits), ("qc", cmd_qc)):
+    for name, fn in (("manifest", cmd_manifest), ("splits", cmd_splits), ("qc", cmd_qc), ("diagnose", cmd_diagnose)):
         s = sub.add_parser(name)
         s.add_argument("--out-dir", default=str(C.MANIFEST_DIR))
         if name == "manifest":

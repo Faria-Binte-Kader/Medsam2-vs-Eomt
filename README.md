@@ -44,15 +44,17 @@ python download_data.py --extract ct_scans_1_4_wawtace_09_05_24.zip --pattern "<
 python process_data.py manifest      # manifests/inventory.csv + excluded.csv
 python process_data.py splits        # manifests/splits.json + splits.csv
 python process_data.py qc --n 12     # manifests/qc_overlays.png + qc_summary.png
+python process_data.py diagnose      # read-only: why annotated cases were excluded + lesion components
 ```
 
-## Results so far (archive 1/4 only; to be regenerated with archives 1/4 + 2/4, seed 42, 70/15/15)
-- 205 CT scans from 56 patients; **48 usable patient-phase-mask tuples** (48 patients): arterial 22, portal 21, delayed 4, native 1.
-- Split: 34 train / 7 val / 7 test. Nested train subsets: 1, 2, 5, 10, 20, 34.
-- 8 annotated tuples excluded: 7 mask-grid mismatches (patients 24, 26, 27, 31, 44, 53, 65; not resampled because alignment cannot be verified) and 1 with mask labels {0, 2} (patient 72).
-- Also logged: patient 7 duplicate instance dropped, stray `63_1_0.nrrd` (identical bytes) ignored, 177 masks whose CT is in the other archives.
-- 149 scans have no mask for their phase: unannotated, not treated as tumor-negative.
-- 83 scans store `scl_inter = -1024`; read CTs only through SimpleITK (it applies the scaling). After scaling the intensity range matches the other scans.
-- 12 QC overlays checked by eye: masks sit on lesions.
+## Results so far (CT archives 1/4 + 2/4, seed 42, 70/15/15)
+- 411 CT scans; **96 usable patient-phase-mask tuples** (96 patients): arterial 46, portal 40, delayed 9, native 1. 173 lesion instances (1 to 6 per tuple).
+- Split: **68 train / 14 val / 14 test**. Test: arterial 8, portal 4, delayed 2. Nested train subsets: 1, 2, 5, 10, 20, 68.
+- Union tumor volume: median 38 mL, range 1.4 to 942 mL (<10 mL: 11, 10-50 mL: 44, >=50 mL: 41 tuples).
+- 17 annotated tuples excluded: 14 mask-grid mismatches (not resampled because alignment cannot be verified; patients 24, 26, 27, 31, 44, 53, 65, 84, 86, 88, 92, 96, 99, 158) and 3 with extra mask label values (patients 72, 119: {0, 2}; 121: {0, 1, 2}). The meaning of label 2 is not documented in what we have, so it is not remapped.
+- Also logged: patient 7 duplicate instance dropped, stray `63_1_0.nrrd` (identical bytes) ignored, 120 masks whose CT is in archives 3/4 or 4/4.
+- 298 scans have no mask for their phase: unannotated, not treated as tumor-negative.
+- 83+ scans store `scl_inter = -1024`; read CTs only through SimpleITK (it applies the scaling).
+- 24 QC overlays (two runs) checked by eye: masks sit on lesions.
 
 Not done yet: preprocessing cache, MedSAM2 inference, metrics. Nothing from MedSAM2 has been run.
