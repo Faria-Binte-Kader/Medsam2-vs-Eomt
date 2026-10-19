@@ -166,3 +166,55 @@ def test_diagnose_cli_on_synthetic_archives(archives, monkeypatch):
     assert 0.9 < d.volume_ratio.iloc[0] <= 1.0  # shifted mask still falls inside the CT
     comp = pd.read_csv(out / "diagnose_components.csv")
     assert comp.n_components.max() >= 1 and (out / "diagnose_cases.png").exists()
+
+
+CT_HDR = {"size_xyz": [20, 16, 6], "spacing_xyz": [0.8, 0.8, 2.0], "origin_xyz": [-100.0, 90.0, 10.0],
+          "direction": [1, 0, 0, 0, -1, 0, 0, 0, 1]}
+
+
+def test_read_instance_native_binary_and_default_rejections(tmp_path):
+    m = box(1, 3, 2, 5, 2, 6)
+    write(tmp_path / "ok.nrrd", m, direction=FLIPY)
+    a, op, prob = P.read_instance_on_ct_grid(tmp_path / "ok.nrrd", CT_HDR)
+    assert prob is None and op == "native" and a.sum() == m.sum()
+    write(tmp_path / "l2.nrrd", m * 2, direction=FLIPY)
+    assert P.read_instance_on_ct_grid(tmp_path / "l2.nrrd", CT_HDR)[2][0] == "unexpected_mask_labels"
+    write(tmp_path / "shift.nrrd", m, direction=FLIPY, origin=(-92.0, 90.0, 10.0))
+    assert P.read_instance_on_ct_grid(tmp_path / "shift.nrrd", CT_HDR)[2][0] == "mask_grid_mismatch"
+
+
+def test_label_remap_resample_and_combination(tmp_path):
+    m = box(1, 3, 2, 5, 2, 6)
+    write(tmp_path / "l2.nrrd", m * 2, direction=FLIPY)
+    a, op, prob = P.read_instance_on_ct_grid(tmp_path / "l2.nrrd", CT_HDR, "label_remap")
+    assert prob is None and op == "nonzero" and a.sum() == m.sum() and set(np.unique(a)) == {0, 1}
+
+    write(tmp_path / "shift.nrrd", m, direction=FLIPY, origin=(-92.0, 90.0, 10.0))  # +10 voxels in x
+    a, op, prob = P.read_instance_on_ct_grid(tmp_path / "shift.nrrd", CT_HDR, "resample")
+    assert prob is None and op == "resample" and a.sum() == m.sum()
+    assert a[1:3, 2:5, 12:16].all() and a.dtype == np.uint8  # box moved 10 voxels, nothing lost
+
+    write(tmp_path / "both.nrrd", m * 2, direction=FLIPY, origin=(-92.0, 90.0, 10.0))
+    a, op, prob = P.read_instance_on_ct_grid(tmp_path / "both.nrrd", CT_HDR, "resample+label_remap")
+    assert prob is None and op == "resample+nonzero" and a.sum() == m.sum()
+
+
+def test_resample_rejected_when_mask_leaves_the_ct(tmp_path):
+    write(tmp_path / "out.nrrd", box(1, 3, 2, 5, 14, 20), direction=FLIPY, origin=(-92.0, 90.0, 10.0))  # pushed off the grid
+    a, op, prob = P.read_instance_on_ct_grid(tmp_path / "out.nrrd", CT_HDR, "resample")
+    assert a is None and prob[0] == "resample_volume_changed"
+
+
+def test_manifest_secondary_set_is_separate_from_primary(archives):
+    raw, ext = archives
+    both = ["ct_scans_1_4_wawtace_09_05_24.zip", "ct_scans_2_4_wawtace_09_05_24.zip"]
+    inv, _ = P.build_manifest(raw, ext, ct_archives=both, secondary={})
+    assert set(inv.eval_set) == {"primary", "excluded", "unannotated"} and inv.usable.sum() == 3
+    # patient 2's mask sits 10 mm (12.5 voxels, not a whole number) off the grid: resampling must be
+    # refused by the volume guard or accepted; either way it never becomes primary
+    inv2, _ = P.build_manifest(raw, ext, ct_archives=both, secondary={2: "resample"})
+    assert inv2.usable.sum() == inv.usable.sum()  # primary set unchanged
+    row = inv2[inv2.patient_id == 2].iloc[0]
+    assert row.eval_set in {"secondary", "excluded"} and not row.usable
+    if row.eval_set == "secondary":
+        assert json.loads(row.mask_ops) == ["resample"] and row.reason.startswith("secondary (resample)")

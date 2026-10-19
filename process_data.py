@@ -213,11 +213,56 @@ def _crc_key(info):
     return (info.CRC, info.file_size)
 
 
-def build_manifest(raw_dir=None, extract_dir=None, patients=None, ct_archives=None):
+def reference_from_header(h):
+    """Empty image on a CT grid, used as the resampling reference."""
+    import SimpleITK as sitk
+    img = sitk.Image([int(x) for x in h["size_xyz"]], sitk.sitkUInt8)
+    img.SetSpacing([float(x) for x in h["spacing_xyz"]])
+    img.SetOrigin([float(x) for x in h["origin_xyz"]])
+    img.SetDirection([float(x) for x in h["direction"]])
+    return img
+
+
+def read_instance_on_ct_grid(path, ct_hdr, rule=None, tol=None):
+    """Read one mask file as a binary uint8 array on the CT grid (z, y, x).
+
+    Returns (array or None, op, problem). `rule` is a "+"-joined subset of {"resample", "label_remap"}
+    (see config.SECONDARY_RULES); with no rule only masks already on the CT grid with labels {0, 1} pass.
+    op records what was done: native | resample | nonzero | resample+nonzero.
+    """
+    import SimpleITK as sitk
+    tol = C.RESAMPLE_VOLUME_TOLERANCE if tol is None else tol
+    flags = set((rule or "").split("+")) - {""}
+    img = sitk.ReadImage(str(path))
+    hm = header(path)
+    ok, why = same_grid(hm, ct_hdr)
+    ops = []
+    if ok:
+        arr = sitk.GetArrayFromImage(img)
+    else:
+        if "resample" not in flags:
+            return None, "native", ("mask_grid_mismatch", "; ".join(why))
+        src = sitk.GetArrayFromImage(img) > 0
+        arr = sitk.GetArrayFromImage(resample_mask_to_ct(img, reference_from_header(ct_hdr)))
+        v0 = float(src.sum()) * float(np.prod(hm["spacing_xyz"]))
+        v1 = float((arr > 0).sum()) * float(np.prod(ct_hdr["spacing_xyz"]))
+        if v0 and abs(v1 / v0 - 1) > tol:
+            return None, "resample", ("resample_volume_changed", f"volume ratio {v1 / v0:.3f} outside +-{tol}")
+        ops.append("resample")
+    labels = set(np.unique(arr).tolist())
+    if not labels <= {0, 1}:
+        if "label_remap" not in flags:
+            return None, "+".join(ops) or "native", ("unexpected_mask_labels", str(sorted(labels)))
+        ops.append("nonzero")
+    return (arr > 0).astype(np.uint8), "+".join(ops) or "native", None
+
+
+def build_manifest(raw_dir=None, extract_dir=None, patients=None, ct_archives=None, secondary=None):
     """Match masks to CTs by exact (patient, phase), verify grids, and return (inventory, excluded) DataFrames."""
     import pandas as pd
     import download_data as D
     raw, ext = Path(raw_dir or C.RAW_DIR), Path(extract_dir or C.EXTRACT_DIR)
+    secondary = C.SECONDARY_RULES if secondary is None else secondary
     ct_zips = [raw / a for a in (ct_archives or C.CT_ARCHIVES)]
     missing = [z.name for z in ct_zips if not z.exists()]
     if missing:
@@ -281,7 +326,8 @@ def build_manifest(raw_dir=None, extract_dir=None, patients=None, ct_archives=No
         row["csv_thickness_matches_z"] = (None if r is None else bool(abs(r.slice_thickness - h["spacing_xyz"][2]) < 0.01))
         if r is None:
             exc(patient, phase, member, "ct_missing_from_metadata_csv")
-        es, seen, used, arrays = groups.get(key, []), {}, [], []
+        es, seen, used, arrays, ops = groups.get(key, []), {}, [], [], []
+        rule = secondary.get(patient)
         row["n_mask_files"] = len(es)
         reason = None
         for e in es:
@@ -293,25 +339,21 @@ def build_manifest(raw_dir=None, extract_dir=None, patients=None, ct_archives=No
             seen[_crc_key(info)] = e["instance"]
             D.safe_extract(mask_zip, ext, e["member"])
             path = ext / e["member"]
-            ok, why = same_grid(header(path), h)
-            if not ok:
-                reason = "mask_grid_mismatch: " + "; ".join(why)
-                exc(patient, phase, e["member"], "mask_grid_mismatch", "; ".join(why))
-                continue
-            a = mask_array(path)
-            labels = set(np.unique(a).tolist())
-            if not labels <= {0, 1}:
-                reason = f"unexpected_mask_labels {sorted(labels)}"
-                exc(patient, phase, e["member"], "unexpected_mask_labels", str(sorted(labels)))
+            a, op, problem = read_instance_on_ct_grid(path, h, rule)
+            if problem:
+                reason = f"{problem[0]}: {problem[1]}"
+                exc(patient, phase, e["member"], problem[0], problem[1])
                 continue
             if not a.any():
                 exc(patient, phase, e["member"], "empty_instance", "dropped")
                 continue
             used.append(e)
             arrays.append(a)
+            ops.append(op)
         row["instance_ids"] = json.dumps([e["instance"] for e in used])
         row["mask_members"] = json.dumps([e["member"] for e in used])
         row["n_instances_used"] = len(used)
+        row["mask_ops"] = json.dumps(ops)
         row["csv_count_matches_files"] = (None if r is None or not es else int(r.tumor_count) == len(es))
         if used:
             u, overlap = union_mask(arrays)
@@ -321,9 +363,15 @@ def build_manifest(raw_dir=None, extract_dir=None, patients=None, ct_archives=No
                        union_volume_ml=vox * float(np.prod(h["spacing_xyz"])) / 1000.0)
         if reason is None and not es:
             reason = "no_mask_for_phase (unannotated; NOT assumed tumor-negative)"
-        elif reason is None and not used:
-            reason = "all_instances_empty_or_duplicate"
-        row["usable"], row["reason"] = reason is None and bool(used), reason or "ok"
+        good = reason is None and bool(used)
+        if good and rule is None:
+            row["eval_set"], row["reason"] = "primary", "ok"
+        elif good:
+            row["eval_set"], row["reason"] = "secondary", f"secondary ({rule}); ops per instance {ops}"
+        else:
+            row["eval_set"] = "unannotated" if not es else "excluded"
+            row["reason"] = reason or "all_instances_empty_or_duplicate"
+        row["usable"] = row["eval_set"] == "primary"  # primary = strict set used for the frozen split
         rows.append(row)
     return pd.DataFrame(rows), pd.DataFrame(excluded)
 
@@ -384,9 +432,12 @@ def cmd_manifest(a):
         print(f"header cross-check vs SimpleITK OK on {arc}:{g.iloc[0]['ct_member']}")
     print("scans per archive:", dict(inv.ct_archive.value_counts()))
     use = inv[inv.usable]
-    print(f"CT scans in archive: {len(inv)}; usable patient-phase-mask tuples: {len(use)}; "
-          f"patients: {use.patient_id.nunique()}")
-    print("not usable:", dict(inv[~inv.usable].reason.str.split(" ").str[0].value_counts()))
+    sec = inv[inv.eval_set == "secondary"]
+    sec.to_csv(out / "secondary.csv", index=False)
+    print(f"CT scans in archive: {len(inv)}; eval_set: {dict(inv.eval_set.value_counts())}")
+    print(f"primary (strict) tuples: {len(use)}; patients: {use.patient_id.nunique()}; "
+          f"secondary patients: {sorted(sec.patient_id)}")
+    print("not primary:", dict(inv[~inv.usable].reason.str.split(" ").str[0].value_counts()))
     print("excluded-log reasons:", dict(exc_df.reason.value_counts()) if len(exc_df) else {})
     print("usable by phase:", dict(use.phase_name.value_counts()))
     print("CSV tumor_count == #mask files (annotated phases):",

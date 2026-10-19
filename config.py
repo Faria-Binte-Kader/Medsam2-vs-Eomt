@@ -58,3 +58,16 @@ PROMPT_CONDITIONS = {
     "mild": dict(pad=5, translate=3, jitter=2),
     "strong": dict(pad=15, translate=10, jitter=6),
 }
+
+# SECONDARY evaluation set: annotated cases that fail the strict primary checks but were reviewed
+# by eye (manifests/diagnose_cases.png). Reported separately; never used for training, validation
+# or model selection, and not part of the frozen split. Flags (joined with "+"):
+#   label_remap: any nonzero mask value = tumor (patients whose only tumor label is 2)
+#   resample:    mask drawn on another grid; nearest-neighbour resample through physical space onto its
+#                own phase's CT grid (volume must stay within +-10 percent)
+SECONDARY_RULES = {
+    72: "label_remap", 119: "label_remap",
+    24: "resample", 26: "resample", 44: "resample", 53: "resample", 86: "resample", 96: "resample",
+    99: "resample", 158: "resample", 84: "resample+label_remap", 92: "resample+label_remap",
+}
+RESAMPLE_VOLUME_TOLERANCE = 0.10

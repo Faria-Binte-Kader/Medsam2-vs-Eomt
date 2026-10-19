@@ -58,3 +58,14 @@ python process_data.py diagnose      # read-only: why annotated cases were exclu
 - 24 QC overlays (two runs) checked by eye: masks sit on lesions.
 
 Not done yet: preprocessing cache, MedSAM2 inference, metrics. Nothing from MedSAM2 has been run.
+
+## Secondary evaluation set (decided after `diagnose`)
+The frozen split uses only the 96 strict (primary) patients. Ten more annotated patients that failed the strict checks were reviewed by eye
+(`manifests/diagnose_cases.png`) and form a **separate secondary set**, reported separately and never used for training, validation or model selection
+(rules in `config.SECONDARY_RULES`, output in `manifests/secondary.csv`):
+- 72, 119: the tumor mask uses label 2 instead of 1 (single-label files outlining a visible mass), so nonzero = tumor.
+- 24, 26, 44, 53, 86, 96, 99, 158: mask drawn on a different grid; resampled (nearest neighbour, through physical space) onto its own phase's CT, volume change within 10%.
+- 84, 92: both of the above.
+Still excluded: 27, 31, 65, 88 (unverifiable or inconsistent grids) and 121 (one file with labels 1 and 2 of unknown meaning).
+
+Findings worth reporting as limitations: the phase digit in a mask filename is not always the phase the mask was drawn on (in 11 of the 14 grid-mismatch patients the mask grid equals a different phase of the same patient), and 25 of the 96 primary CTs have a grid identical to another phase of the same patient, so geometry alone cannot prove which phase the mask was drawn on.
