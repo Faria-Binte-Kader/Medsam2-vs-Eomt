@@ -60,7 +60,7 @@ python process_data.py diagnose      # read-only: why annotated cases were exclu
 Not done yet: preprocessing cache, MedSAM2 inference, metrics. Nothing from MedSAM2 has been run.
 
 ## Secondary evaluation set (decided after `diagnose`)
-The frozen split uses only the 96 strict (primary) patients. Ten more annotated patients that failed the strict checks were reviewed by eye
+The frozen split uses only the 96 strict (primary) patients. Twelve more annotated patients that failed the strict checks were reviewed by eye
 (`manifests/diagnose_cases.png`) and form a **separate secondary set**, reported separately and never used for training, validation or model selection
 (rules in `config.SECONDARY_RULES`, output in `manifests/secondary.csv`):
 - 72, 119: the tumor mask uses label 2 instead of 1 (single-label files outlining a visible mass), so nonzero = tumor.
@@ -69,3 +69,14 @@ The frozen split uses only the 96 strict (primary) patients. Ten more annotated 
 Still excluded: 27, 31, 65, 88 (unverifiable or inconsistent grids) and 121 (one file with labels 1 and 2 of unknown meaning).
 
 Findings worth reporting as limitations: the phase digit in a mask filename is not always the phase the mask was drawn on (in 11 of the 14 grid-mismatch patients the mask grid equals a different phase of the same patient), and 25 of the 96 primary CTs have a grid identical to another phase of the same patient, so geometry alone cannot prove which phase the mask was drawn on.
+
+## Preprocessing
+```bash
+python process_data.py preprocess --limit 1          # one volume end to end (debug)
+python process_data.py preprocess                    # all primary + secondary cases -> $WAWTACE_CACHE_DIR (default data/cache)
+```
+Per case it audits the HU range after SimpleITK applies the NIfTI scaling (air reaches about -1000, tumor median plausible, integer-valued), windows to uint8
+(`config.HU_WINDOW`, default -140..260), caches `case.npz` (windowed CT, union mask, instance masks) and `meta.json` (source files, native geometry,
+window, software versions, git commit), and writes `manifests/preprocess_audit.csv`. Volumes failing the audit are flagged and not cached.
+The model-side input (gray to RGB, 512 resize, ImageNet normalisation) is built at inference time by `to_medsam2_input`, and predictions are mapped back
+to the CT's spacing/origin/direction by `restore_to_native` / `write_native_mask`. A cache built with a different window or version is refused.

@@ -6,6 +6,7 @@
   python process_data.py splits                     # splits.json/csv + nested train subsets
   python process_data.py qc --n 12                  # overlay + summary figures
   python process_data.py diagnose                   # read-only: why annotated cases were excluded; lesion components
+  python process_data.py preprocess [--limit 1]     # HU audit + windowed uint8 cache + provenance (primary + secondary)
 
 File-name conventions below were read from the real archive listings:
   CT   <p>/<p>_<phase>_scan.nii.gz
@@ -644,6 +645,212 @@ def _ct_ref(r, D):
     return img
 
 
+# ----------------------------------------------------------------------------- preprocessing
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+def window_to_uint8(hu, lo=None, hi=None):
+    """Clip to the CT window and map [lo, hi] -> [0, 255], truncating to uint8 like the upstream script.
+
+    Upstream rescales with the clipped volume's own min/max; that equals lo/hi whenever the volume spans
+    the window (always true for these CTs), so the window bounds are used explicitly here.
+    """
+    lo, hi = C.HU_WINDOW if lo is None or hi is None else (lo, hi)
+    x = (np.clip(np.asarray(hu, dtype=np.float32), lo, hi) - lo) / (hi - lo) * 255.0
+    return x.astype(np.uint8)
+
+
+def to_medsam2_input(ct_u8, size=None):
+    """uint8 (z, H, W) -> float32 (z, 3, size, size): gray->RGB, PIL default (bicubic) resize, /255, ImageNet norm.
+
+    Mirrors resize_grayscale_to_rgb_and_resize + normalisation in upstream medsam2_infer_3D_CT.py.
+    """
+    from PIL import Image
+    size = size or C.MEDSAM2["input_size"]
+    out = np.zeros((len(ct_u8), 3, size, size), dtype=np.float32)
+    for i, sl in enumerate(ct_u8):
+        rgb = np.array(Image.fromarray(sl).convert("RGB").resize((size, size))).transpose(2, 0, 1)
+        out[i] = rgb / 255.0
+    mean = np.array(IMAGENET_MEAN, dtype=np.float32)[None, :, None, None]
+    std = np.array(IMAGENET_STD, dtype=np.float32)[None, :, None, None]
+    return (out - mean) / std
+
+
+def restore_to_native(pred, geometry):
+    """Model-side mask (z, h, w) -> native grid uint8 (z, H, W).
+
+    The upstream predictor already returns masks at the original slice size (init_state is given the native
+    height/width), so for these 512x512 CTs this is an identity. If a different size arrives it is resized with
+    nearest-neighbour (never an interpolating filter, which would create non-binary values).
+    """
+    from PIL import Image
+    pred = np.asarray(pred) > 0
+    W, H, Z = geometry["size_xyz"]
+    if pred.shape[0] != Z:
+        raise ValueError(f"slice count {pred.shape[0]} != native {Z}")
+    if pred.shape[1:] != (H, W):
+        pred = np.stack([np.array(Image.fromarray(s.astype(np.uint8)).resize((W, H), Image.NEAREST)) for s in pred]) > 0
+    return pred.astype(np.uint8)
+
+
+def array_to_sitk(arr, geometry):
+    """Array (z, y, x) on the CT grid -> SimpleITK image carrying the CT's spacing/origin/direction."""
+    import SimpleITK as sitk
+    img = sitk.GetImageFromArray(np.asarray(arr))
+    img.SetSpacing([float(x) for x in geometry["spacing_xyz"]])
+    img.SetOrigin([float(x) for x in geometry["origin_xyz"]])
+    img.SetDirection([float(x) for x in geometry["direction"]])
+    return img
+
+
+def write_native_mask(arr, geometry, path):
+    import SimpleITK as sitk
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    sitk.WriteImage(array_to_sitk(restore_to_native(arr, geometry), geometry), str(path), useCompression=True)
+
+
+def hist_percentiles(hu_int, qs):
+    """Exact percentiles of an integer volume via its histogram (avoids a float64 copy of ~80M voxels)."""
+    lo = int(hu_int.min())
+    counts = np.bincount((hu_int.ravel() - lo).astype(np.int64))
+    cdf = np.cumsum(counts) / counts.sum()
+    return [float(lo + np.searchsorted(cdf, q / 100.0)) for q in qs]
+
+
+def audit_hu(hu, tumor=None, window=None):
+    """Intensity audit on the SimpleITK-read (scaling applied) volume. Flags, never fixes."""
+    lo, hi = window or C.HU_WINDOW
+    hu_int = np.rint(hu).astype(np.int32)
+    a = {"integer_valued": bool(np.abs(hu - hu_int).max() < 1e-3), "hu_min": int(hu_int.min()), "hu_max": int(hu_int.max())}
+    a["p0.5"], a["p50"], a["p99.5"] = hist_percentiles(hu_int, [0.5, 50, 99.5])
+    if tumor is not None and tumor.any():
+        t = hu[tumor > 0]
+        a.update(tumor_median=float(np.median(t)), tumor_p5=float(np.percentile(t, 5)),
+                 tumor_p95=float(np.percentile(t, 95)),
+                 tumor_frac_outside_window=float(((t < lo) | (t > hi)).mean()))
+    cfg = C.HU_AUDIT
+    a["air_ok"] = a["p0.5"] <= cfg["air_percentile_max"]
+    a["range_ok"] = cfg["hu_min_floor"] <= a["hu_min"] and a["hu_max"] <= cfg["hu_max_ceiling"]
+    a["tumor_ok"] = ("tumor_median" in a and cfg["tumor_median_range"][0] <= a["tumor_median"] <= cfg["tumor_median_range"][1])
+    a["hu_plausible"] = bool(a["integer_valued"] and a["air_ok"] and a["range_ok"] and a["tumor_ok"])
+    return a
+
+
+def case_dir(row, cache_dir=None):
+    return Path(cache_dir or C.CACHE_DIR) / row["eval_set"] / f"p{int(row['patient_id'])}_ph{int(row['phase'])}"
+
+
+def save_case(path, ct_u8, union, instances, instance_ids, meta):
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path / "case.npz", ct_u8=ct_u8, mask_union=union, instances=instances,
+                        instance_ids=np.array(instance_ids))
+    (path / "meta.json").write_text(json.dumps(meta, indent=1, default=str))
+
+
+def load_case(path):
+    path = Path(path)
+    z = np.load(path / "case.npz")
+    meta = json.loads((path / "meta.json").read_text())
+    if meta["preprocess_version"] != C.PREPROCESS_VERSION or meta["window_hu"] != list(C.HU_WINDOW):
+        raise RuntimeError(f"stale cache at {path}: rebuild with `process_data.py preprocess --force`")
+    return {"ct_u8": z["ct_u8"], "mask_union": z["mask_union"], "instances": z["instances"],
+            "instance_ids": z["instance_ids"].tolist(), "meta": meta}
+
+
+def _git_head():
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", str(C.ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+    except Exception:
+        return None
+
+
+def preprocess_case(row, ext, cache_dir=None, force=False, keep_implausible=False):
+    """Read one CT + its masks, audit HU, window to uint8, cache arrays + provenance. Returns (audit_row, status)."""
+    import SimpleITK as sitk
+    import download_data as D
+    out = case_dir(row, cache_dir)
+    if not force and (out / "meta.json").exists():
+        try:
+            m = json.loads((out / "meta.json").read_text())
+            if m["preprocess_version"] == C.PREPROCESS_VERSION and m["window_hu"] == list(C.HU_WINDOW):
+                return m["audit_row"], "cached"
+        except (KeyError, ValueError):
+            pass
+    ct_hdr = header_from_row(row)
+    rule = C.SECONDARY_RULES.get(int(row["patient_id"])) if row["eval_set"] == "secondary" else None
+    mask_zip = C.RAW_DIR / "tumor_masks_wawtace_v1_08_05_2024.zip"
+    members = json.loads(row["mask_members"])
+    insts, ops = [], []
+    for m in members:
+        D.safe_extract(mask_zip, ext, m)
+        a, op, problem = read_instance_on_ct_grid(ext / m, ct_hdr, rule)
+        if problem:
+            raise RuntimeError(f"{m}: {problem}")
+        insts.append(a)
+        ops.append(op)
+    union, overlap = union_mask(insts)
+    D.safe_extract(C.RAW_DIR / row["ct_archive"], ext, row["ct_member"])
+    ct_path = ext / row["ct_member"]
+    hu = sitk.GetArrayFromImage(sitk.ReadImage(str(ct_path)))  # SimpleITK applies scl_slope/scl_inter
+    ct_path.unlink()
+    if list(hu.shape) != ct_hdr["size_xyz"][::-1]:
+        raise RuntimeError(f"CT array shape {hu.shape} != manifest size {ct_hdr['size_xyz']}")
+    aud = audit_hu(hu, union)
+    arow = {"patient_id": int(row["patient_id"]), "phase": int(row["phase"]), "eval_set": row["eval_set"],
+            "scl_inter": row["scl_inter"], "stored_dtype": str(hu.dtype), **aud}
+    if not aud["hu_plausible"] and not keep_implausible:
+        return arow, "implausible_hu_not_cached"
+    meta = {
+        "preprocess_version": C.PREPROCESS_VERSION, "patient_id": int(row["patient_id"]), "phase": int(row["phase"]),
+        "phase_name": row["phase_name"], "eval_set": row["eval_set"],
+        "source": {"ct_archive": row["ct_archive"], "ct_member": row["ct_member"], "mask_members": members,
+                   "mask_ops": ops, "secondary_rule": rule},
+        "geometry": ct_hdr, "array_axis_order": "z, y, x (SimpleITK GetArrayFromImage); geometry lists are x, y, z",
+        "window_hu": list(C.HU_WINDOW), "intensity": "clip to window, (x-lo)/(hi-lo)*255, truncate to uint8",
+        "mask_interpolation": C.MASK_INTERPOLATION, "instance_ids": json.loads(row["instance_ids"]),
+        "instance_overlap_voxels": overlap,
+        "model_input": {"size": C.MEDSAM2["input_size"], "resize": "PIL default (bicubic) applied at inference time",
+                        "mean": IMAGENET_MEAN, "std": IMAGENET_STD,
+                        "inverse": "predictor outputs at native HxW (init_state video_height/width); restore_to_native"},
+        "audit": aud, "audit_row": arow,
+        "software": {"SimpleITK": sitk.Version.VersionString(), "numpy": np.__version__}, "git_commit": _git_head(),
+    }
+    save_case(out, window_to_uint8(hu), union, np.stack(insts), meta["instance_ids"], meta)
+    return arow, "cached_new"
+
+
+def cmd_preprocess(a):
+    import pandas as pd
+    out = Path(a.out_dir)
+    inv = pd.read_csv(out / "inventory.csv")
+    sets = ["primary", "secondary"] if a.eval_set == "all" else [a.eval_set]
+    todo = inv[inv.eval_set.isin(sets)]
+    if a.patients:
+        todo = todo[todo.patient_id.isin(a.patients)]
+    if a.limit:
+        todo = todo.head(a.limit)
+    rows = []
+    for i, (_, r) in enumerate(todo.iterrows(), 1):
+        arow, status = preprocess_case(r, C.EXTRACT_DIR, force=a.force, keep_implausible=a.keep_implausible)
+        arow["status"] = status
+        rows.append(arow)
+        print(f"[{i}/{len(todo)}] p{arow['patient_id']} {r['phase_name']} {r['eval_set']}: {status} "
+              f"(hu {arow['hu_min']}..{arow['hu_max']}, tumor median {arow.get('tumor_median', float('nan')):.0f})")
+    df = pd.DataFrame(rows)
+    path = out / ("preprocess_audit.csv" if not (a.patients or a.limit) else "preprocess_audit_partial.csv")
+    df.to_csv(path, index=False)
+    print(f"wrote {path}; status: {dict(df.status.value_counts())}; HU-plausible: {int(df.hu_plausible.sum())}/{len(df)}")
+    bad = df[~df.hu_plausible]
+    if len(bad):
+        print("FLAGGED (not cached):\n", bad[["patient_id", "phase", "hu_min", "hu_max", "p0.5", "tumor_median", "air_ok", "range_ok", "tumor_ok", "integer_valued"]].to_string(index=False))
+    if (df.tumor_frac_outside_window.notna()).any():
+        print(f"tumor voxels outside the {C.HU_WINDOW} window: median {df.tumor_frac_outside_window.median():.3%}, max {df.tumor_frac_outside_window.max():.3%}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -652,13 +859,20 @@ if __name__ == "__main__":
     s.add_argument("--patients", type=int, nargs="+", default=[10, 13])
     s.add_argument("--out", default=str(C.OUTPUT_DIR / "inspect_report.json"))
     s.set_defaults(fn=cmd_inspect)
-    for name, fn in (("manifest", cmd_manifest), ("splits", cmd_splits), ("qc", cmd_qc), ("diagnose", cmd_diagnose)):
+    for name, fn in (("manifest", cmd_manifest), ("splits", cmd_splits), ("qc", cmd_qc), ("diagnose", cmd_diagnose),
+                     ("preprocess", cmd_preprocess)):
         s = sub.add_parser(name)
         s.add_argument("--out-dir", default=str(C.MANIFEST_DIR))
         if name == "manifest":
             s.add_argument("--patients", type=int, nargs="+", help="debug: restrict to these patients")
         if name == "qc":
             s.add_argument("--n", type=int, default=12)
+        if name == "preprocess":
+            s.add_argument("--eval-set", choices=["primary", "secondary", "all"], default="all")
+            s.add_argument("--patients", type=int, nargs="+", help="debug: only these patients")
+            s.add_argument("--limit", type=int, help="debug: first N cases (e.g. --limit 1)")
+            s.add_argument("--force", action="store_true", help="rebuild even if a valid cache exists")
+            s.add_argument("--keep-implausible", action="store_true", help="cache volumes that fail the HU audit")
         s.set_defaults(fn=fn)
     a = ap.parse_args()
     a.fn(a)

@@ -71,3 +71,11 @@ SECONDARY_RULES = {
     99: "resample", 158: "resample", 84: "resample+label_remap", 92: "resample+label_remap",
 }
 RESAMPLE_VOLUME_TOLERANCE = 0.10
+
+# Preprocessing. The window is applied only to volumes that pass the HU audit (see process_data.py preprocess).
+PREPROCESS_VERSION = 1
+HU_AUDIT = {  # heuristic plausibility bounds, used to flag (not silently fix) volumes
+    "air_percentile_max": -900.0,      # 0.5th percentile of the volume should reach air
+    "hu_min_floor": -3100.0, "hu_max_ceiling": 4100.0,
+    "tumor_median_range": (-50.0, 250.0),
+}
