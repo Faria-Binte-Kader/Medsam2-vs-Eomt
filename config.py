@@ -22,10 +22,14 @@ DEVICE = "cuda"  # "cuda" | "cpu"
 BATCH_SIZE = 1
 
 ZENODO_RECORD = "12741586"
+CT_ARCHIVES = [
+    "ct_scans_1_4_wawtace_09_05_24.zip",
+    "ct_scans_2_4_wawtace_09_05_24.zip",
+]
 DEFAULT_FILES = [
     "ct_hcc_metadata_v2.csv",
     "tumor_masks_wawtace_v1_08_05_2024.zip",
-    "ct_scans_1_4_wawtace_09_05_24.zip",
+    *CT_ARCHIVES,
 ]
 DISK_MARGIN = 1.25  # require size * margin free before downloading
 PHASES = {0: "native", 1: "arterial", 2: "portal", 3: "delayed"}

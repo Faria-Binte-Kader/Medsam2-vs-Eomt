@@ -106,15 +106,18 @@ def mask_stats(path):
 
 def cmd_names(_):
     masks, odd_m = parse_archive_names(C.RAW_DIR / "tumor_masks_wawtace_v1_08_05_2024.zip", parse_mask_name)
-    cts, odd_c = parse_archive_names(C.RAW_DIR / "ct_scans_1_4_wawtace_09_05_24.zip", parse_ct_name)
+    cts, odd_c = [], []
+    for arc in C.CT_ARCHIVES:
+        c, o = parse_archive_names(C.RAW_DIR / arc, parse_ct_name)
+        cts, odd_c = cts + c, odd_c + o
     print(f"masks: {len(masks)} files, {len({e['patient'] for e in masks})} patients; non-conforming: {odd_m}")
-    print(f"CT archive 1/4: {len(cts)} scans, {len({e['patient'] for e in cts})} patients; non-conforming: {odd_c[:5]}")
+    print(f"CT archives {C.CT_ARCHIVES}: {len(cts)} scans, {len({e['patient'] for e in cts})} patients; non-conforming: {odd_c[:5]}")
     print("mask phase counts:", dict(sorted(Counter(e["phase"] for e in masks).items())))
     print("CT phase counts:", dict(sorted(Counter(e["phase"] for e in cts).items())))
     ct_keys = {(e["patient"], e["phase"]) for e in cts}
     mask_keys = {(e["patient"], e["phase"]) for e in masks}
-    print(f"(patient,phase) with BOTH a scan in archive 1/4 and a mask (by name only): {len(ct_keys & mask_keys)}")
-    print(f"mask (patient,phase) keys whose CT is not in archive 1/4: {len(mask_keys - ct_keys)}")
+    print(f"(patient,phase) with BOTH a scan in the configured archives and a mask (by name only): {len(ct_keys & mask_keys)}")
+    print(f"mask (patient,phase) keys whose CT is not in the configured archives: {len(mask_keys - ct_keys)}")
     per = defaultdict(set)
     for e in masks:
         per[e["patient"]].add(e["phase"])
@@ -124,7 +127,6 @@ def cmd_names(_):
 def cmd_inspect(a):
     out_dir = C.EXTRACT_DIR
     import download_data as D
-    ct_zip = C.RAW_DIR / "ct_scans_1_4_wawtace_09_05_24.zip"
     mask_zip = C.RAW_DIR / "tumor_masks_wawtace_v1_08_05_2024.zip"
     csv = C.RAW_DIR / "ct_hcc_metadata_v2.csv"
     if csv.exists():
@@ -135,7 +137,8 @@ def cmd_inspect(a):
     report = []
     for p in a.patients:
         D.safe_extract(mask_zip, out_dir, f"*/{p}/{p}_*")
-        D.safe_extract(ct_zip, out_dir, f"{p}/{p}_*")
+        for arc in C.CT_ARCHIVES:
+            D.safe_extract(C.RAW_DIR / arc, out_dir, f"{p}/{p}_*")
     for p in a.patients:
         ct_files = sorted(out_dir.rglob(f"{p}/{p}_*_scan.nii.gz"))
         mask_files = sorted(out_dir.rglob(f"{p}/{p}_*_tumor_seg.nrrd"))
@@ -209,12 +212,16 @@ def _crc_key(info):
     return (info.CRC, info.file_size)
 
 
-def build_manifest(raw_dir=None, extract_dir=None, patients=None):
+def build_manifest(raw_dir=None, extract_dir=None, patients=None, ct_archives=None):
     """Match masks to CTs by exact (patient, phase), verify grids, and return (inventory, excluded) DataFrames."""
     import pandas as pd
     import download_data as D
     raw, ext = Path(raw_dir or C.RAW_DIR), Path(extract_dir or C.EXTRACT_DIR)
-    ct_zip, mask_zip = raw / "ct_scans_1_4_wawtace_09_05_24.zip", raw / "tumor_masks_wawtace_v1_08_05_2024.zip"
+    ct_zips = [raw / a for a in (ct_archives or C.CT_ARCHIVES)]
+    missing = [z.name for z in ct_zips if not z.exists()]
+    if missing:
+        raise FileNotFoundError(f"configured CT archive(s) not found in {raw}: {missing}")
+    mask_zip = raw / "tumor_masks_wawtace_v1_08_05_2024.zip"
     meta = pd.read_csv(raw / "ct_hcc_metadata_v2.csv")
     csv_idx = {(int(r.patient_id), int(r.ct_phase)): r for r in meta.itertuples()}
     excluded = []
@@ -222,19 +229,21 @@ def build_manifest(raw_dir=None, extract_dir=None, patients=None):
     def exc(patient, phase, item, reason, detail=""):
         excluded.append({"patient_id": patient, "phase": phase, "item": item, "reason": reason, "detail": detail})
 
-    cts, odd_ct = parse_archive_names(ct_zip, parse_ct_name)
-    for name in odd_ct:
-        exc(None, None, name, "nonconforming_ct_name")
-    cts = [e for e in cts if patients is None or e["patient"] in patients]
-
-    with zipfile.ZipFile(ct_zip) as zc:
-        ct_hdr = {}
-        for e in cts:
-            key = (e["patient"], e["phase"])
-            if key in ct_hdr:
-                exc(*key, e["member"], "duplicate_ct_for_patient_phase")
-                continue
-            ct_hdr[key] = (e["member"], ct_header_from_zip(zc, e["member"]))
+    ct_hdr = {}
+    for ct_zip in ct_zips:
+        cts, odd_ct = parse_archive_names(ct_zip, parse_ct_name)
+        for name in odd_ct:
+            exc(None, None, f"{ct_zip.name}:{name}", "nonconforming_ct_name")
+        with zipfile.ZipFile(ct_zip) as zc:
+            for e in cts:
+                if patients is not None and e["patient"] not in patients:
+                    continue
+                key = (e["patient"], e["phase"])
+                if key in ct_hdr:
+                    exc(*key, f"{ct_zip.name}:{e['member']}", "duplicate_ct_for_patient_phase",
+                        f"already seen in {ct_hdr[key][0]}; later copy ignored")
+                    continue
+                ct_hdr[key] = (ct_zip.name, e["member"], ct_header_from_zip(zc, e["member"]))
 
     masks, odd_m = parse_archive_names(mask_zip, parse_mask_name)
     with zipfile.ZipFile(mask_zip) as zm:
@@ -251,15 +260,15 @@ def build_manifest(raw_dir=None, extract_dir=None, patients=None):
     for key, es in groups.items():
         if key not in ct_hdr and (patients is None or key[0] in patients):
             exc(*key, f"{len(es)} mask file(s)", "ct_not_in_downloaded_archive",
-                "mask has no CT of the same patient+phase in archive 1/4 (not an error)")
+                "mask has no CT of the same patient+phase in the configured CT archives (not an error)")
 
     rows = []
     for key in sorted(ct_hdr):
         patient, phase = key
-        member, h = ct_hdr[key]
+        archive, member, h = ct_hdr[key]
         r = csv_idx.get(key)
         row = {
-            "patient_id": patient, "phase": phase, "phase_name": C.PHASES[phase], "ct_member": member,
+            "patient_id": patient, "phase": phase, "phase_name": C.PHASES[phase], "ct_archive": archive, "ct_member": member,
             **{f"size_{a}": v for a, v in zip("xyz", h["size_xyz"])},
             **{f"spacing_{a}": v for a, v in zip("xyz", h["spacing_xyz"])},
             **{f"origin_{a}": v for a, v in zip("xyz", h["origin_xyz"])},
@@ -369,10 +378,10 @@ def cmd_manifest(a):
     inv, exc_df = build_manifest(patients=set(a.patients) if a.patients else None)
     inv.to_csv(out / "inventory.csv", index=False)
     exc_df.to_csv(out / "excluded.csv", index=False)
-    if len(inv):
-        first = inv.iloc[0]
-        cross_check_ct_header(C.RAW_DIR / "ct_scans_1_4_wawtace_09_05_24.zip", first["ct_member"], C.EXTRACT_DIR)
-        print(f"header cross-check vs SimpleITK OK on {first['ct_member']}")
+    for arc, g in inv.groupby("ct_archive"):
+        cross_check_ct_header(C.RAW_DIR / arc, g.iloc[0]["ct_member"], C.EXTRACT_DIR)
+        print(f"header cross-check vs SimpleITK OK on {arc}:{g.iloc[0]['ct_member']}")
+    print("scans per archive:", dict(inv.ct_archive.value_counts()))
     use = inv[inv.usable]
     print(f"CT scans in archive: {len(inv)}; usable patient-phase-mask tuples: {len(use)}; "
           f"patients: {use.patient_id.nunique()}")
@@ -416,13 +425,12 @@ def cmd_qc(a):
     inv = pd.read_csv(out / "inventory.csv")
     use = inv[inv.usable]
     pick = use.sample(n=min(a.n, len(use)), random_state=C.SEED)
-    ct_zip = C.RAW_DIR / "ct_scans_1_4_wawtace_09_05_24.zip"
     cols = 4
     fig, axes = plt.subplots((len(pick) + cols - 1) // cols, cols, figsize=(4 * cols, 4 * ((len(pick) + cols - 1) // cols)))
     axes = np.atleast_1d(axes).ravel()
     lo, hi = C.HU_WINDOW
     for ax, (_, r) in zip(axes, pick.iterrows()):
-        D.safe_extract(ct_zip, C.EXTRACT_DIR, r.ct_member)
+        D.safe_extract(C.RAW_DIR / r.ct_archive, C.EXTRACT_DIR, r.ct_member)
         ct_path = C.EXTRACT_DIR / r.ct_member
         ct = sitk.GetArrayFromImage(sitk.ReadImage(str(ct_path)))
         ct_path.unlink()

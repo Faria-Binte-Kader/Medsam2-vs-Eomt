@@ -33,8 +33,26 @@ Paths can be changed in `config.py` or with env vars `WAWTACE_RAW_DIR`, `WAWTACE
 ## Download data
 ```bash
 python download_data.py --dry-run          # URLs, sizes, MD5s, disk check; downloads nothing
-python download_data.py                    # metadata CSV + tumor masks ZIP + CT archive 1/4 (10.36 GB)
+python download_data.py                    # metadata CSV + tumor masks ZIP + CT archives 1/4 and 2/4 (~20.9 GB)
 python download_data.py --list ct_scans_1_4_wawtace_09_05_24.zip       # inspect members
 python download_data.py --extract tumor_masks_wawtace_v1_08_05_2024.zip
 python download_data.py --extract ct_scans_1_4_wawtace_09_05_24.zip --pattern "<fnmatch pattern>"
 ```
+
+## Inventory, splits, QC
+```bash
+python process_data.py manifest      # manifests/inventory.csv + excluded.csv
+python process_data.py splits        # manifests/splits.json + splits.csv
+python process_data.py qc --n 12     # manifests/qc_overlays.png + qc_summary.png
+```
+
+## Results so far (archive 1/4 only; to be regenerated with archives 1/4 + 2/4, seed 42, 70/15/15)
+- 205 CT scans from 56 patients; **48 usable patient-phase-mask tuples** (48 patients): arterial 22, portal 21, delayed 4, native 1.
+- Split: 34 train / 7 val / 7 test. Nested train subsets: 1, 2, 5, 10, 20, 34.
+- 8 annotated tuples excluded: 7 mask-grid mismatches (patients 24, 26, 27, 31, 44, 53, 65; not resampled because alignment cannot be verified) and 1 with mask labels {0, 2} (patient 72).
+- Also logged: patient 7 duplicate instance dropped, stray `63_1_0.nrrd` (identical bytes) ignored, 177 masks whose CT is in the other archives.
+- 149 scans have no mask for their phase: unannotated, not treated as tumor-negative.
+- 83 scans store `scl_inter = -1024`; read CTs only through SimpleITK (it applies the scaling). After scaling the intensity range matches the other scans.
+- 12 QC overlays checked by eye: masks sit on lesions.
+
+Not done yet: preprocessing cache, MedSAM2 inference, metrics. Nothing from MedSAM2 has been run.
