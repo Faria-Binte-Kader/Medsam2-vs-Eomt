@@ -113,7 +113,8 @@ def main():
     import pandas as pd
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run-dir", required=True)
-    ap.add_argument("--split", choices=["val", "test", "secondary"], default="val")
+    ap.add_argument("--split", choices=["train", "val", "test", "secondary"], default="val",
+                    help="train is for sanity checks on patients the model was trained on (always written to a *_debug folder)")
     ap.add_argument("--select", action="store_true", help="score every saved checkpoint on the validation patients and record the best")
     ap.add_argument("--weights", help="a specific weights file (not allowed on test/secondary)")
     ap.add_argument("--device", choices=["cuda", "cpu"], default=C.DEVICE)
@@ -166,7 +167,7 @@ def main():
         sys.exit("give --weights, or run --select first")
     step, _ = load_weights(net, weights)
     rows = cases_for(a.split, inv, splits, a.patients, a.limit)
-    debug = bool(a.limit or a.patients or a.weights)
+    debug = bool(a.limit or a.patients or a.weights or a.split == "train")
     out = run / f"eval_{a.split}{'_debug' if debug else ''}"
     recs = evaluate_patients(net, torch, rows, a.split, a.device, out, size, f"step{step}", a.hd95, a.batch_slices)
     vol = pd.DataFrame(recs)
