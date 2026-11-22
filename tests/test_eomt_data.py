@@ -103,9 +103,10 @@ def test_extra_orderings_are_seeded_train_only_and_leave_frozen_order_alone(proj
     sp = json.loads((man / "splits.json").read_text())
     frozen, val = E.subset_patients(man, 2, 0)
     assert frozen == sp["train_subsets"]["2"]
-    a, b = E.subset_patients(man, 3, 5), E.subset_patients(man, 3, 5)
-    assert a == b and set(a[0]) <= set(sp["train"]) and len(set(a[0])) == 3 and a[1] == val  # deterministic, TRAIN only
-    assert set(E.subset_patients(man, 2, 5)[0]) <= set(E.subset_patients(man, 3, 5)[0])  # nested within an ordering
+    a, b = E.subset_patients(man, 2, 5), E.subset_patients(man, 2, 5)
+    assert a == b and set(a[0]) <= set(sp["train"]) and len(set(a[0])) == 2 and a[1] == val  # deterministic, TRAIN only
+    assert set(E.subset_patients(man, 1, 5)[0]) <= set(a[0])  # nested within an ordering
+    assert any(E.subset_patients(man, 2, k)[0] != frozen for k in range(1, 12))  # orderings really differ from the frozen one
     assert E.subset_patients(man, "all", 5)[0] == sp["train_subsets"]["all"]
 
 
