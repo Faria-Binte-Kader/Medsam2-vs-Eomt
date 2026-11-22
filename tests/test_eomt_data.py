@@ -98,6 +98,17 @@ def test_datamodule_nested_subsets_and_validation_isolated(project):
         E.subset_patients(man, 7)  # only the frozen nested sizes are allowed
 
 
+def test_extra_orderings_are_seeded_train_only_and_leave_frozen_order_alone(project):
+    man, _ = project
+    sp = json.loads((man / "splits.json").read_text())
+    frozen, val = E.subset_patients(man, 2, 0)
+    assert frozen == sp["train_subsets"]["2"]
+    a, b = E.subset_patients(man, 3, 5), E.subset_patients(man, 3, 5)
+    assert a == b and set(a[0]) <= set(sp["train"]) and len(set(a[0])) == 3 and a[1] == val  # deterministic, TRAIN only
+    assert set(E.subset_patients(man, 2, 5)[0]) <= set(E.subset_patients(man, 3, 5)[0])  # nested within an ordering
+    assert E.subset_patients(man, "all", 5)[0] == sp["train_subsets"]["all"]
+
+
 def test_dataloaders_yield_eomt_batches(project):
     man, cache = project
     dm = E.WawTaceSlices(n_patients=2, manifest_dir=str(man), cache_dir=str(cache), num_workers=0, batch_size=4,

@@ -107,12 +107,20 @@ class CTTransforms(Transforms):
         self.random_horizontal_flip = T.RandomHorizontalFlip(p=0.0)
 
 
-def subset_patients(manifest_dir, n_patients):
+def subset_patients(manifest_dir, n_patients, order_seed=0):
+    """Training patients for a subset size plus the validation patients.
+
+    order_seed 0 is the frozen nested ordering from splits.json. order_seed k > 0 is an extra random ordering of the same
+    TRAIN patients (numpy default_rng(k) permutation, first n taken), used only to measure how much small subsets vary.
+    """
     sp = json.loads((Path(manifest_dir) / "splits.json").read_text())
     key = str(n_patients)
     if key not in sp["train_subsets"]:
         raise ValueError(f"n_patients={n_patients} not in the frozen subsets {list(sp['train_subsets'])}")
-    return sp["train_subsets"][key], sp["val"]
+    if int(order_seed) == 0 or key == "all":
+        return sp["train_subsets"][key], sp["val"]
+    order = np.random.default_rng(int(order_seed)).permutation(sp["train"]).tolist()
+    return [int(p) for p in order[:int(key)]], sp["val"]
 
 
 class WeightsCheckpoint(lightning.pytorch.Callback):
@@ -157,18 +165,19 @@ class WawTaceSlices(LightningDataModule):
         scale_range: tuple[float, float] = C.EOMT_TRAIN["scale_range"],
         seed: int = C.SEED,
         info_path: Optional[str] = None,
+        order_seed: int = 0,
     ) -> None:
         super().__init__(path=manifest_dir, batch_size=batch_size, num_workers=num_workers, num_classes=num_classes,
                          img_size=img_size, check_empty_targets=False)
         self.save_hyperparameters(ignore=["_class_path"])
         self.n_patients, self.manifest_dir, self.cache_dir = str(n_patients), manifest_dir, cache_dir
-        self.neg_per_pos, self.seed, self.info_path = neg_per_pos, seed, info_path
+        self.neg_per_pos, self.seed, self.info_path, self.order_seed = neg_per_pos, seed, info_path, order_seed
         self.transforms = CTTransforms(img_size, scale_range)
 
     def setup(self, stage: Optional[str] = None):
         import pandas as pd
         inv = pd.read_csv(Path(self.manifest_dir) / "inventory.csv")
-        train_ids, val_ids = subset_patients(self.manifest_dir, self.n_patients)
+        train_ids, val_ids = subset_patients(self.manifest_dir, self.n_patients, self.order_seed)
         cts, masks, self.train_ids = load_patients(train_ids, inv, self.cache_dir)
         pos, neg = slice_index(masks)
         self.train_dataset = SliceDataset(cts, masks, pos + neg, self.transforms)
@@ -184,7 +193,7 @@ class WawTaceSlices(LightningDataModule):
         self.val_counts = {"patients": len(val_ids), "tumor_slices": len(vpos), "slices": len(self.val_dataset)}
         if self.info_path:  # record exactly which patients and how many slices this run trained on
             Path(self.info_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(self.info_path).write_text(json.dumps({"n_patients": self.n_patients, "train_patients": self.train_ids,
+            Path(self.info_path).write_text(json.dumps({"n_patients": self.n_patients, "order_seed": self.order_seed, "train_patients": self.train_ids,
                                                         "val_patients": self.val_ids, "train": self.train_counts,
                                                         "val": self.val_counts}, indent=1))
         return self

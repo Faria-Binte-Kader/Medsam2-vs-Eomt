@@ -72,7 +72,8 @@ def build_config(a, out_dir):
             "class_path": "eomt_data.WawTaceSlices",
             "init_args": {"n_patients": a.n_patients, "manifest_dir": str(C.MANIFEST_DIR), "cache_dir": str(C.CACHE_DIR),
                           "num_workers": a.num_workers, "batch_size": a.batch_size, "img_size": [a.img_size, a.img_size],
-                          "neg_per_pos": a.neg_per_pos, "seed": a.seed, "info_path": str(out / "data_info.json")},
+                          "neg_per_pos": a.neg_per_pos, "seed": a.seed, "info_path": str(out / "data_info.json"),
+                          "order_seed": a.order_seed},
         },
     }
     return cfg
@@ -114,6 +115,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4, help="EoMT's default; decide any change on validation patients only")
     ap.add_argument("--neg-per-pos", type=float, default=C.EOMT_TRAIN["neg_per_pos"])
     ap.add_argument("--seed", type=int, default=C.SEED)
+    ap.add_argument("--order-seed", type=int, default=0,
+                    help="0 = the frozen nested subsets; k>0 = an extra random ordering of the train patients (variability of small subsets)")
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--val-every", type=int, help="steps between validation passes (default steps // 8)")
     ap.add_argument("--ckpt-every", type=int, help="steps between saved weights (default steps // 6)")
@@ -123,7 +126,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    name = a.run_name or f"n{a.n_patients}_{a.init}_s{a.steps}_seed{a.seed}"
+    name = a.run_name or f"n{a.n_patients}_{a.init}_s{a.steps}_seed{a.seed}" + (f"_order{a.order_seed}" if a.order_seed else "")
     out = C.OUTPUT_DIR / "eomt" / name
     check_setup(a)
     cfg = build_config(a, out)

@@ -119,6 +119,7 @@ def main():
     ap.add_argument("--weights", help="a specific weights file (not allowed on test/secondary)")
     ap.add_argument("--device", choices=["cuda", "cpu"], default=C.DEVICE)
     ap.add_argument("--hd95", action="store_true")
+    ap.add_argument("--prune", action="store_true", help="with --select: delete every weights file except the selected one")
     ap.add_argument("--patients", type=int, nargs="+")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--batch-slices", type=int, default=16)
@@ -155,6 +156,11 @@ def main():
         best_file.write_text(json.dumps({"best_step": best, "selected_on": "validation patients only (mean per-patient 3D Dice)",
                                          "val_dice_by_step": scores, "weights": str(run / "weights" / f"step{best}.pt")}, indent=1))
         print(f"best checkpoint on validation: step {best}; recorded in {best_file}")
+        if a.prune:
+            gone = [w for w in (run / "weights").glob("step*.pt") if int(w.stem[4:]) != best]
+            for w in gone:
+                w.unlink()
+            print(f"pruned {len(gone)} non-selected weights files (the scores for all of them are kept in best_step.json)")
         return
 
     if a.split in ("test", "secondary"):
@@ -173,6 +179,7 @@ def main():
     vol = pd.DataFrame(recs)
     vol.insert(vol.columns.get_loc("model") + 1, "n_train_patients", info["args"]["n_patients"])
     vol.insert(vol.columns.get_loc("model") + 2, "init", info["args"]["init"])
+    vol.insert(vol.columns.get_loc("model") + 3, "order_seed", info["args"].get("order_seed", 0))
     vol.to_csv(out / "volume_metrics.csv", index=False)
     vol["condition"] = "automatic"  # no prompt conditions for EoMT; keeps the shared summary code usable
     per_patient, summary = M.summarize(vol, ("dice", "iou"), ("condition",), C.BOOTSTRAP["seed"], C.BOOTSTRAP["n"])
