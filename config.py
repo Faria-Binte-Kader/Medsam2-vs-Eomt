@@ -16,6 +16,7 @@ MODELS_DIR = _p("WAWTACE_MODELS_DIR", "checkpoints")
 OUTPUT_DIR = _p("WAWTACE_OUTPUT_DIR", "results")
 MANIFEST_DIR = _p("WAWTACE_MANIFEST_DIR", "manifests")  # small CSV/JSON files, safe to commit
 MEDSAM2_DIR = _p("MEDSAM2_DIR", "MedSAM2")
+EOMT_DIR = _p("EOMT_DIR", "EoMT")
 
 SEED = 42
 DEVICE = "cuda"  # "cuda" | "cpu"
@@ -98,3 +99,31 @@ PROMPT = {
 Z_MODES = ("unbounded", "gt_extent")
 SIZE_BINS_ML = (10.0, 50.0)   # predeclared tumor-size bins: <10, 10-50, >=50 mL
 BOOTSTRAP = {"n": 2000, "seed": SEED}
+
+# EoMT (official tue-mps/eomt, MIT). Pinned like MedSAM2. Its own requirements pin torch 2.7.0, lightning 2.5.1, transformers 4.56.1,
+# python 3.13.2 (README), so it lives in a separate conda env.
+EOMT = {
+    "repo": "https://github.com/tue-mps/eomt",
+    "commit": "aa017c34afbe023de9462b17ae6067b52fef9867",   # main as of 2026-10-12, checked 2026-11-22
+    "license": "MIT",
+    # Segmentation-pretrained EoMT-L, ADE20K semantic, 512x512 (the only semantic checkpoint at this input size in the model zoo)
+    "ade20k_semantic_L512": {
+        "hf_repo": "tue-mps/ade20k_semantic_eomt_large_512",
+        "hf_revision": "aeb262f5a0bc609236d27f1277c3173ce57aeb27",
+        "filename": "pytorch_model.bin",
+        "size_bytes": 1264209218,
+        "sha256": "314968b0cde91d3c85111041aeea4534abaa8ccc50a498f26db89e6469fcbb61",
+    },
+    # DINOv2-only initialisation: timm downloads this backbone itself when no ckpt_path is given (records the hub revision)
+    "dinov2_backbone": {"timm_name": "vit_large_patch14_reg4_dinov2", "hf_repo": "timm/vit_large_patch14_reg4_dinov2.lvd142m",
+                        "hf_revision": "f3c408e77602bb412aa65fb03dfa0d5f95cb3832"},
+}
+
+# EoMT slice training (eomt_data.py / train_eomt.py). Decided before any EoMT training run.
+EOMT_TRAIN = {
+    "num_classes": 2,              # 0 = background, 1 = tumor (see eomt_data.py for why background is a class)
+    "img_size": (512, 512),        # native slice size; EoMT's ADE20K semantic size
+    "neg_per_pos": 1.0,            # tumor-free slices sampled per tumor slice, redrawn every epoch (seeded)
+    "scale_range": (0.75, 1.33),   # scale jitter; no flip, no colour jitter (gray CT)
+    "batch_size": 8,
+}

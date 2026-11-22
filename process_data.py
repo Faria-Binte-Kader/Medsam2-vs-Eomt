@@ -749,14 +749,16 @@ def save_case(path, ct_u8, union, instances, instance_ids, meta):
     (path / "meta.json").write_text(json.dumps(meta, indent=1, default=str))
 
 
-def load_case(path):
+def load_case(path, keys=("ct_u8", "mask_union", "instances", "instance_ids")):
+    """Load a cached case. `keys` selects arrays (EoMT only needs ct_u8 and mask_union); meta is always returned."""
     path = Path(path)
     z = np.load(path / "case.npz")
     meta = json.loads((path / "meta.json").read_text())
     if meta["preprocess_version"] != C.PREPROCESS_VERSION or meta["window_hu"] != list(C.HU_WINDOW):
         raise RuntimeError(f"stale cache at {path}: rebuild with `process_data.py preprocess --force`")
-    return {"ct_u8": z["ct_u8"], "mask_union": z["mask_union"], "instances": z["instances"],
-            "instance_ids": z["instance_ids"].tolist(), "meta": meta}
+    out = {k: (z[k].tolist() if k == "instance_ids" else z[k]) for k in keys}
+    out["meta"] = meta
+    return out
 
 
 def _git_head():
