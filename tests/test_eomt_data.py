@@ -108,7 +108,8 @@ def test_dataloaders_yield_eomt_batches(project):
     assert imgs.shape == (4, 3, H, W) and imgs.dtype == torch.uint8 and len(targets) == 4
     assert all({"masks", "labels", "is_crowd"} <= set(t) for t in targets)
     vimgs, vtargets = next(iter(dm.val_dataloader()))  # evaluation collate: tuples of variable-size items
-    assert isinstance(vimgs, tuple) and vimgs[0].shape == (3, H, W) and len(vtargets) == len(vimgs)
+    # a tuple locally, a list when CUDA is present (DataLoader pin_memory converts tuples); EoMT only indexes into it
+    assert isinstance(vimgs, (tuple, list)) and vimgs[0].shape == (3, H, W) and len(vtargets) == len(vimgs)
     one = E.WawTaceSlices(n_patients=1, manifest_dir=str(man), cache_dir=str(cache), num_workers=0, batch_size=64,
                           img_size=(H, W)).setup()
     assert len(list(one.train_dataloader())) == 1  # tiny subsets still yield a batch (drop_last off)
