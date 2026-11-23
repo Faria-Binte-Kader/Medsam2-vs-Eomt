@@ -420,12 +420,57 @@ def make_splits(patients, ratios=None, seed=None, subset_sizes=None):
             "train": train, "val": val, "test": test, "train_subsets": subsets, "notes": notes}
 
 
+def extend_splits(base, inventory, new_sizes=None, seed=None):
+    """Extension: keep the frozen val/test and every existing train assignment; append newly available primary patients to TRAIN only.
+
+    `base` is the frozen splits dict (manifests/splits.json); `inventory` the extended inventory (all four CT archives). New patients
+    are ordered by a seeded permutation and appended after the existing train order, so every existing nested subset is unchanged.
+    The old 'all' becomes its size (e.g. '68'); 'all' now means every train patient of the extended split.
+    """
+    seed = base["seed"] if seed is None else seed
+    new_sizes = C.EXT_TRAIN_SUBSET_SIZES if new_sizes is None else new_sizes
+    prim = inventory[inventory.eval_set == "primary"]
+    known = set(base["train"]) | set(base["val"]) | set(base["test"])
+    missing = sorted(known - set(int(p) for p in prim.patient_id))
+    if missing:
+        raise ValueError(f"frozen patients no longer primary in the extended inventory: {missing}")
+    fresh = sorted({int(p) for p in prim.patient_id} - known)
+    order = [fresh[i] for i in np.random.default_rng(seed).permutation(len(fresh))]
+    train = list(base["train"]) + order
+    old_all = str(len(base["train"]))
+    subsets = {k: list(v) for k, v in base["train_subsets"].items() if k != "all"}
+    subsets[old_all] = list(base["train_subsets"]["all"])
+    notes = [f"extension: {len(order)} new TRAIN patients appended after the frozen {old_all}; val and test unchanged; old 'all' is now '{old_all}'"]
+    for k in new_sizes:
+        size = len(train) if k == "all" else int(k)
+        if size > len(train):
+            notes.append(f"requested train subset {k} > {len(train)} available; skipped")
+            continue
+        key = "all" if k == "all" else str(k)
+        if key != "all" and key in subsets:
+            continue
+        subsets[key] = train[:size]
+    for k, v in base["train_subsets"].items():
+        if k != "all":
+            assert subsets[k] == v, "an existing nested subset changed"
+    assert subsets[old_all] == train[:len(base["train"])]
+    s = {"train": set(train), "val": set(base["val"]), "test": set(base["test"])}
+    assert not (s["train"] & s["val"] or s["train"] & s["test"]), "patient leakage"
+    assert len(train) == len(set(train))
+    out = dict(base)
+    out.update({"n_patients": len(train) + len(base["val"]) + len(base["test"]),
+                "counts": {k: len(v) for k, v in s.items()}, "train": train, "train_subsets": subsets,
+                "notes": notes, "extension": {"new_train_patients": order, "val_test_unchanged": True}})
+    return out
+
+
 # ----------------------------------------------------------------------------- QC figures
 def cmd_manifest(a):
     import pandas as pd
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    inv, exc_df = build_manifest(patients=set(a.patients) if a.patients else None)
+    archives = C.CT_ARCHIVES + C.CT_ARCHIVES_EXT if getattr(a, "extension", False) else None
+    inv, exc_df = build_manifest(patients=set(a.patients) if a.patients else None, ct_archives=archives)
     inv.to_csv(out / "inventory.csv", index=False)
     exc_df.to_csv(out / "excluded.csv", index=False)
     for arc, g in inv.groupby("ct_archive"):
@@ -453,6 +498,13 @@ def cmd_splits(a):
     import pandas as pd
     out = Path(a.out_dir)
     inv = pd.read_csv(out / "inventory.csv")
+    if getattr(a, "extend_from", None):
+        base = json.loads(Path(a.extend_from).read_text())
+        sp = extend_splits(base, inv)
+        (out / "splits.json").write_text(json.dumps(sp, indent=1))
+        print(f"extension: {sp['counts']}, new TRAIN patients {len(sp['extension']['new_train_patients'])}")
+        print("nested train subsets:", {k: len(v) for k, v in sp["train_subsets"].items()}, sp["notes"])
+        return
     pats = inv[inv.usable].patient_id.unique()
     sp = make_splits(pats)
     (out / "splits.json").write_text(json.dumps(sp, indent=1))
@@ -867,6 +919,10 @@ if __name__ == "__main__":
         s.add_argument("--out-dir", default=str(C.MANIFEST_DIR))
         if name == "manifest":
             s.add_argument("--patients", type=int, nargs="+", help="debug: restrict to these patients")
+        if name == "manifest":
+            s.add_argument("--extension", action="store_true", help="also read CT archives 3/4 and 4/4 (config.CT_ARCHIVES_EXT); use with --out-dir manifests_ext")
+        if name == "splits":
+            s.add_argument("--extend-from", metavar="SPLITS_JSON", help="extension: keep this frozen split and append new patients to TRAIN only")
         if name == "qc":
             s.add_argument("--n", type=int, default=12)
         if name == "preprocess":

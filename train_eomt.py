@@ -22,7 +22,6 @@ import yaml
 
 import config as C
 
-SUBSETS = ["1", "2", "5", "10", "20", "all"]
 
 
 def annealing_schedule(total_steps, num_blocks=4):
@@ -70,7 +69,7 @@ def build_config(a, out_dir):
         },
         "data": {
             "class_path": "eomt_data.WawTaceSlices",
-            "init_args": {"n_patients": a.n_patients, "manifest_dir": str(C.MANIFEST_DIR), "cache_dir": str(C.CACHE_DIR),
+            "init_args": {"n_patients": a.n_patients, "manifest_dir": str(a.manifest_dir), "cache_dir": str(C.CACHE_DIR),
                           "num_workers": a.num_workers, "batch_size": a.batch_size, "img_size": [a.img_size, a.img_size],
                           "neg_per_pos": a.neg_per_pos, "seed": a.seed, "info_path": str(out / "data_info.json"),
                           "order_seed": a.order_seed},
@@ -106,7 +105,8 @@ def check_setup(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--n-patients", required=True, choices=SUBSETS, help="nested TRAIN subset from the frozen split")
+    ap.add_argument("--n-patients", required=True, help="nested TRAIN subset key in splits.json (1, 2, 5, 10, 20, all; extension adds 68, 100, ...)")
+    ap.add_argument("--manifest-dir", default=str(C.MANIFEST_DIR), help="manifests/ (frozen, default) or manifests_ext/ (extension)")
     ap.add_argument("--steps", type=int, required=True, help="total optimizer steps (same for all subset sizes in a comparison)")
     ap.add_argument("--init", choices=["ade20k", "dinov2"], default="ade20k")
     ap.add_argument("--backbone", default=C.EOMT["dinov2_backbone"]["timm_name"])
@@ -126,6 +126,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
+    sp = json.loads((Path(a.manifest_dir) / "splits.json").read_text())
+    if a.n_patients not in sp["train_subsets"]:
+        sys.exit(f"--n-patients {a.n_patients} not in {Path(a.manifest_dir) / 'splits.json'}: {list(sp['train_subsets'])}")
     name = a.run_name or f"n{a.n_patients}_{a.init}_s{a.steps}_seed{a.seed}" + (f"_order{a.order_seed}" if a.order_seed else "")
     out = C.OUTPUT_DIR / "eomt" / name
     check_setup(a)
@@ -140,7 +143,7 @@ def main():
     (out / "run_info.json").write_text(json.dumps({
         "command": sys.argv, "args": vars(a), "eomt": {"commit": eomt_commit(), "pinned": C.EOMT["commit"]},
         "init": a.init, "init_checkpoint_sha256": C.EOMT["ade20k_semantic_L512"]["sha256"] if a.init == "ade20k" else None,
-        "classes": {"0": "background", "1": "tumor"}, "window_hu": C.HU_WINDOW, "frozen_split": str(C.MANIFEST_DIR / "splits.json"),
+        "classes": {"0": "background", "1": "tumor"}, "window_hu": C.HU_WINDOW, "frozen_split": str(Path(a.manifest_dir) / "splits.json"),
         "note": "Automatic model: sees only the CT slice, no prompts, no ground-truth localization."}, indent=1, default=str))
     env = dict(os.environ, PYTHONPATH=os.pathsep.join([str(C.ROOT), str(C.EOMT_DIR), os.environ.get("PYTHONPATH", "")]),
                WANDB_MODE="offline", WANDB_DIR=str(out))

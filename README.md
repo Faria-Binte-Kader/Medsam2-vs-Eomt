@@ -7,14 +7,15 @@ not a fully automatic one.
 - `config.py` – paths, seed, device, CT window, split ratios, MedSAM2 pins, prompt perturbations
 - `fetch_medsam2.py` – clones MedSAM2 at the pinned commit, downloads and SHA-256-checks `MedSAM2_latest.pt`
 - `download_data.py` – WAW-TACE downloader: Zenodo API URLs/MD5s, resumable, retried, atomic, disk check, safe selective ZIP extraction
-- `process_data.py` – archive inspection, manifest/matching, splits, QC figures (preprocessing to be added)
+- `process_data.py` – archive inspection, manifest/matching, splits, QC figures, preprocessing cache
 - `run_medsam2.py` – zero-shot MedSAM2 evaluation (oracle-prompted baseline)
 - `fetch_eomt.py`, `eomt_data.py`, `train_eomt.py`, `eval_eomt.py` – EoMT fine-tuning on slices of the frozen TRAIN patients and 3D evaluation (below)
+- `run_eomt_sweep.py`, `analyze_eomt.py` – the six-size EoMT sweep (train, select on validation, prune) and the learning-curve analysis against MedSAM2
 - `metrics.py`, `make_figures.py` – shared metrics; slide figures from a finished run
 - `tests/`
 
 ## Setup (two conda envs, kept separate)
-MedSAM2's `setup.py` needs numpy>=2.0.1 and torch>=2.5.1, so EoMT gets its own env later.
+MedSAM2's `setup.py` needs numpy>=2.0.1 and torch>=2.5.1, so EoMT has its own env (EoMT pins torch 2.7.0).
 
 ```bash
 # MedSAM2 env (versions are the ones MedSAM2 documents; use a CUDA wheel index matching `nvidia-smi`)
@@ -25,8 +26,7 @@ python fetch_medsam2.py            # add --dry-run to preview
 pip install --no-build-isolation -e MedSAM2   # compiles the optional CUDA extension against YOUR torch; without --no-build-isolation pip builds against a different torch and `_C.so` fails to load
 python -m pytest -q tests
 
-# EoMT env (later phase; pins to be decided after reading https://github.com/tue-mps/eomt)
-conda create -n eomt python=3.10 -y
+# EoMT env: see "EoMT fine-tuning" below (python 3.13.2, torch 2.7.0)
 ```
 
 Paths can be changed in `config.py` or with env vars `WAWTACE_RAW_DIR`, `WAWTACE_CACHE_DIR`,
@@ -49,7 +49,7 @@ python process_data.py qc --n 12     # manifests/qc_overlays.png + qc_summary.pn
 python process_data.py diagnose      # read-only: why annotated cases were excluded + lesion components
 ```
 
-## Results so far (CT archives 1/4 + 2/4, seed 42, 70/15/15)
+## Data and split (CT archives 1/4 + 2/4, seed 42, 70/15/15)
 - 411 CT scans; **96 usable patient-phase-mask tuples** (96 patients): arterial 46, portal 40, delayed 9, native 1. 173 lesion instances (1 to 6 per tuple).
 - Split: **68 train / 14 val / 14 test**. Test: arterial 8, portal 4, delayed 2. Nested train subsets: 1, 2, 5, 10, 20, 68.
 - Union tumor volume: median 38 mL, range 1.4 to 942 mL (<10 mL: 11, 10-50 mL: 44, >=50 mL: 41 tuples).
@@ -59,7 +59,7 @@ python process_data.py diagnose      # read-only: why annotated cases were exclu
 - 83+ scans store `scl_inter = -1024`; read CTs only through SimpleITK (it applies the scaling).
 - 24 QC overlays (two runs) checked by eye: masks sit on lesions.
 
-Not done yet: preprocessing cache, MedSAM2 inference, metrics. Nothing from MedSAM2 has been run.
+The sections below record what was done afterwards: preprocessing, the frozen MedSAM2 baseline, and the EoMT learning curve.
 
 ## Secondary evaluation set (decided after `diagnose`)
 The frozen split uses only the 96 strict (primary) patients. Twelve more annotated patients that failed the strict checks were reviewed by eye
@@ -109,7 +109,7 @@ refused unless `--allow-test-config-change` is given. Debug runs (`--limit`, `--
 - Offline unit tests (66): prompt boxes (empty, border-touching), perturbation reproducibility/clipping/invalid handling, lesion components, metrics with known answers, native-space restoration, split disjointness, test-split guard, checkpoint refusal.
 - Runner orchestration is tested with a stub predictor defined only in the tests (never used for results).
 - The real pinned MedSAM2 code and checkpoint (SHA-256 verified) were run on CPU on a *synthetic* volume to check loading, box prompting, forward/reverse propagation and native-grid output. Its Dice is meaningless and is not a result.
-- Not yet run: the pipeline on real WAW-TACE volumes, on GPU (bf16 autocast path), or any reported metric. No real MedSAM2 result exists yet.
+- Afterwards the pipeline was run on the real WAW-TACE volumes on GPU (validation development runs, then the frozen test runs reported below).
 
 ### z-extent modes and the CUDA extension
 `--z-mode unbounded` (default) propagates the key-slice box through the whole volume, as the upstream scripts do. `--z-mode gt_extent` also gives the lesion's
@@ -197,11 +197,76 @@ python -m pytest -q tests                  # eomt_data / eval_eomt tests run her
 - Inference runs on every slice with no prompt and takes EoMT's own semantic read-out (argmax over the two classes at the last block); slices are stacked into a 3D mask, restored to native geometry and scored with `metrics.py` (same CSV columns as the MedSAM2 runs).
 ```bash
 python eomt_data.py --n-patients 5                                 # slice counts for a subset (tumor slices vs tumor-free), no training
-python train_eomt.py --n-patients 5 --steps 3000 --dry-run         # shows the exact EoMT config that would run
-python train_eomt.py --n-patients 5 --steps 3000 --compile         # trains; run dir results/eomt/n5_ade20k_s3000_seed42/
-python eval_eomt.py --run-dir results/eomt/n5_ade20k_s3000_seed42 --select --hd95
-python eval_eomt.py --run-dir results/eomt/n5_ade20k_s3000_seed42 --split test --hd95
+python train_eomt.py --n-patients 5 --steps 6000 --dry-run         # shows the exact EoMT config that would run
+python train_eomt.py --n-patients 5 --steps 6000 --compile --val-every 1000 --ckpt-every 250 --run-name demo
+python eval_eomt.py --run-dir results/eomt/demo --select --prune   # score every checkpoint on VALIDATION, keep only the best weights
+python eval_eomt.py --run-dir results/eomt/demo --split test --hd95
+python eval_eomt.py --run-dir results/eomt/demo --split train --patients 125 --weights results/eomt/demo/weights/step6000.pt   # sanity check only, never a result
+python run_eomt_sweep.py --dry-run                                 # the full sweep below: list the jobs
+python run_eomt_sweep.py --gpus 0 1                                # run it (one job per GPU at a time; finished jobs are skipped)
+python analyze_eomt.py --out-dir figures                           # learning curve, size bins, per-patient table
 ```
-`--steps` has no default on purpose: the number of steps, learning rate and the tumor-free ratio are to be fixed using validation patients only (smallest and largest subset), written down, and then kept identical for every subset size before any test evaluation.
+`--steps` has no default on purpose. `--order-seed k` (k > 0) draws an extra random ordering of the TRAIN patients instead of the frozen nested subsets.
 
-**Verification status:** unit tests (data module against EoMT's real classes, sampler, nested subsets, evaluation, selection and test guard) pass. A 6-step CPU training run with a small backbone on synthetic slices ran through EoMT's own training loop (loss, validation, weights saved, evaluated by `eval_eomt.py`). The pinned ADE20K EoMT-L checkpoint was loaded with a new 2-class head (encoder and query weights identical to the checkpoint; one 512x512 forward pass checked). Not yet run: any real training on WAW-TACE slices, on GPU, with `torch.compile`, or torch 2.7.0 (local checks used torch 2.5.1). No EoMT result exists yet.
+### Protocol actually used (fixed on validation patients, before any EoMT test evaluation)
+- **Pilot on validation only** (largest and smallest subset, 6,000 steps, checkpoints every 500): with all 68 patients validation Dice rose from 0.59 (step 500) to a plateau of
+  0.63 to 0.66 from step 2,000 (best 0.663 at step 4,500, 0.635 at step 6,000), so 6,000 steps was kept for every size. Settings were not tuned beyond that.
+- **Settings identical for all sizes:** ADE20K-pretrained EoMT-L (100 queries, fresh 2-class head), 6,000 steps, learning rate 1e-4 (EoMT's default), batch 8, 1:1 tumor-free:tumor slice ratio,
+  mixed precision (fp16), `torch.compile`, seed 42, annealing and warm-up schedules scaled to the number of steps, checkpoints every 250 steps, validation monitoring every 1,000 steps.
+  Runs: nested sizes 1, 2, 5, 10, 20, all (68); extra random orderings 1 and 2 for sizes 1 and 2 only (`--order-seed 1, 2`) to show how much a tiny subset depends on which patients were drawn.
+  Software on the lab server: torch 2.7.0+cu126, 3x RTX 5000 Ada (two used for the sweep).
+- **Checkpoint selection:** the checkpoint with the highest mean per-patient 3D Dice on the 14 validation patients (earlier step on ties); the other weights were deleted (`--prune`).
+  Test used only that checkpoint, once per run; the 10 runs were evaluated once and nothing was changed afterwards.
+- **A check that the 1-patient failure is not a pipeline bug:** the 1-patient model scored Dice 0.976 on its own training patient (predicted 25.8 mL vs 25.9 mL true, 0 false-positive slices) while scoring about 0.003 on validation patients,
+  where it labelled most slices as tumor (2,000 to 4,000 mL predicted vs 94 mL true). Training, inference, geometry restoration and metrics agree; the failure is generalization from one patient.
+
+### Results: EoMT learning curve on the primary test set (14 patients, test 3D Dice, per-patient mean)
+Bootstrap 95% CI over patients. Sizes 1 and 2 are the mean over the 3 orderings (each patient's Dice averaged over orderings first); the min to max of the per-ordering means is shown. Larger sizes have one ordering.
+
+| training patients | EoMT automatic Dice [95% CI] | per-ordering min to max |
+|---|---|---|
+| 1 | 0.188 [0.117, 0.270] | 0.068 to 0.268 |
+| 2 | 0.311 [0.217, 0.405] | 0.256 to 0.353 |
+| 5 | 0.366 [0.226, 0.510] | single ordering |
+| 10 | 0.486 [0.351, 0.619] | single ordering |
+| 20 | 0.553 [0.431, 0.656] | single ordering |
+| 68 (all) | 0.654 [0.543, 0.751] | single ordering |
+
+MedSAM2 reference on the same 14 test patients (oracle boxes, unbounded): exact 0.858 [0.832, 0.884], mild 0.806 [0.722, 0.865], strong 0.540 [0.397, 0.670]. Figure: `figures/fig_learning_curve.png`;
+tables: `figures/eomt_learning_curve.csv`, `figures/eomt_by_size_bin.csv`, `figures/eomt_vs_medsam2_per_patient.csv`. Validation best Dice per size (frozen ordering) was 0.07 / 0.28 / 0.32 / 0.42 / 0.54 / 0.66 for 1 / 2 / 5 / 10 / 20 / 68 patients.
+
+**Reading these numbers**
+- With all 68 training patients, fully automatic EoMT (0.65) stays below MedSAM2 with exact boxes (0.86) and below the mild-perturbation reference (0.81); it is above the strong-perturbation reference (0.54) from about 20 patients on.
+- The curve is still rising at 68 patients, so these data do not show where, or whether, EoMT would reach the exact-box reference; this is not extrapolated.
+- Intervals are wide (14 test patients) and neighbouring sizes overlap; only the broad trend and the 1-patient vs 68-patient contrast are firm. Sizes 5 to 68 have a single ordering and a single seed, so their variability from patient choice is not measured.
+- By tumor size, the 68-patient model scores 0.72 (>=50 mL), 0.67 (10 to 50 mL) and 0.39 (<10 mL; 2 test patients, descriptive only).
+- The comparison is not like for like: MedSAM2 receives privileged ground-truth localization, EoMT is fully automatic.
+
+**Limitations to report:** checkpoints were saved every 250 steps and for sizes 1, 2 and 5 the validation-selected checkpoint is usually the first one (step 250), so the true early peak of the small-subset runs is probably missed and their results are slightly underestimated;
+one training seed per run; the validation set (14 patients) is small and used for checkpoint selection, so validation numbers are optimistic and are not reported as results; the secondary set was not evaluated with EoMT.
+
+**Verification status:** unit tests cover the data module against EoMT's real classes, the sampler, nested subsets and extra orderings, evaluation, selection and the test guard. The pinned ADE20K EoMT-L checkpoint is SHA-256-verified. Real training and evaluation ran on the lab server with GPU and `torch.compile`
+(a 300-step debug run, the validation pilot, and the sweep above). `--split train` exists only for the sanity check above and writes to `eval_train_debug`.
+
+## Further step (extension, not part of the results above): more training patients from CT archives 3/4 and 4/4
+**Status: code written and unit-tested; nothing from this step has been run on real data.** Everything above uses CT archives 1/4 and 2/4 only. The masks file contains 120 annotated cases whose CT is in archives 3/4 and 4/4
+(logged by `manifest`), which could roughly double the training data. The EoMT learning curve was still rising at 68 patients, so this extension asks whether more labeled data closes the gap to MedSAM2.
+It is reported as an additional step and never merged into the numbers above.
+
+**Rules (written before any run):**
+- The frozen validation and test patients do not change and stay out of training. New patients are appended to TRAIN only, after the existing 68, so sizes 1 to 68 keep exactly the same patients, and the finished runs and the MedSAM2 baseline stay valid.
+- The frozen `manifests/` are never rewritten: the extension writes `manifests_ext/` (inventory, splits). `process_data.py splits --extend-from` asserts that val/test and every existing nested subset are unchanged. In the extended split, `all` means every train patient and the old `all` is the key `68`.
+- New sizes (`config.EXT_TRAIN_SUBSET_SIZES`: 100 and all) use identical settings (6,000 steps, lr 1e-4, 1:1 ratio, seed 42, checkpoint selection on the same validation patients). If validation Dice of the largest run is still rising at step 6,000,
+  the step budget for the new sizes is revisited on validation only and recorded before any new test evaluation. Run names start with `ext_`.
+- The same strict matching, exclusions, HU audit and window are applied to the new patients.
+
+```bash
+python download_data.py --files ct_scans_3_4_wawtace_09_05_24.zip ct_scans_4_4_wawtace_09_05_24.zip --dry-run   # confirm the names, sizes and free disk (about 20 GB) first
+python download_data.py --files ct_scans_3_4_wawtace_09_05_24.zip ct_scans_4_4_wawtace_09_05_24.zip
+python process_data.py manifest   --extension --out-dir manifests_ext        # all four archives -> manifests_ext/inventory.csv
+python process_data.py splits     --extend-from manifests/splits.json --out-dir manifests_ext
+python process_data.py preprocess --eval-set primary --out-dir manifests_ext # caches only new cases; existing valid caches are reused
+python run_eomt_sweep.py --sizes 100 all --manifest-dir manifests_ext --prefix ext --dry-run
+python run_eomt_sweep.py --sizes 100 all --manifest-dir manifests_ext --prefix ext --gpus 0 1
+```
+After the runs finish, evaluate them on test with `eval_eomt.py --split test` (once each, validation-chosen checkpoint) and add the new sizes to the learning curve; the 68-patient point is the existing `sweep_nall` run.

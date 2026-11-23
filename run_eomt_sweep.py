@@ -1,7 +1,8 @@
 """Run the whole EoMT learning-curve sweep with identical settings, spread over the available GPUs.
 
   python run_eomt_sweep.py --dry-run                  # list the jobs and the exact commands
-  python run_eomt_sweep.py --gpus 0 1 2               # train, select on validation, prune weights; one job per GPU at a time
+  python run_eomt_sweep.py --gpus 0 1 2
+  python run_eomt_sweep.py --sizes 100 all --manifest-dir manifests_ext --prefix ext --gpus 0 1   # extension runs (README)               # train, select on validation, prune weights; one job per GPU at a time
 
 Jobs: the six frozen nested sizes (1, 2, 5, 10, 20, all) plus extra random orderings (--extra-orders, default 1 2) for the
 small sizes (--extra-sizes, default 1 2), which only measure how much a tiny subset depends on which patients were drawn.
@@ -23,8 +24,8 @@ SIZES = ["all", "20", "10", "5", "2", "1"]  # longest first so the GPUs stay bus
 SETTINGS = {"steps": 6000, "val_every": 1000, "ckpt_every": 250}
 
 
-def job_name(size, order):
-    return f"sweep_n{size}" + (f"_order{order}" if order else "")
+def job_name(size, order, prefix="sweep"):
+    return f"{prefix}_n{size}" + (f"_order{order}" if order else "")
 
 
 def make_jobs(extra_orders, extra_sizes):
@@ -32,10 +33,12 @@ def make_jobs(extra_orders, extra_sizes):
     return jobs
 
 
-def commands(size, order, steps, val_every, ckpt_every):
-    name = job_name(size, order)
+def commands(size, order, steps, val_every, ckpt_every, prefix="sweep", manifest_dir=None):
+    name = job_name(size, order, prefix)
     train = [sys.executable, "train_eomt.py", "--n-patients", size, "--steps", str(steps), "--compile",
              "--val-every", str(val_every), "--ckpt-every", str(ckpt_every), "--order-seed", str(order), "--run-name", name]
+    if manifest_dir:
+        train += ["--manifest-dir", str(manifest_dir)]
     select = [sys.executable, "eval_eomt.py", "--run-dir", str(C.OUTPUT_DIR / "eomt" / name), "--select", "--prune"]
     return name, train, select
 
@@ -45,14 +48,22 @@ def main():
     ap.add_argument("--gpus", nargs="+", default=["0"], help="GPU ids to use, one job at a time on each")
     ap.add_argument("--steps", type=int, default=SETTINGS["steps"])
     ap.add_argument("--extra-orders", type=int, nargs="*", default=[1, 2])
+    ap.add_argument("--extra-orders-explicit", action="store_true", help="with --sizes: also run the extra orderings for --extra-sizes")
     ap.add_argument("--extra-sizes", nargs="*", default=["1", "2"], choices=SIZES)
+    ap.add_argument("--sizes", nargs="+", default=None, help="subset keys to run (default: the six frozen sizes)")
+    ap.add_argument("--manifest-dir", default=None, help="manifests_ext/ for the extension (default: frozen manifests/)")
+    ap.add_argument("--prefix", default="sweep", help="run-name prefix; the extension uses ext")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    jobs = make_jobs(a.extra_orders, a.extra_sizes)
+    if a.sizes:  # extension or custom run: only the listed sizes, no extra orderings unless asked for
+        jobs = [(s, 0) for s in a.sizes] + [(s, o) for o in a.extra_orders for s in a.extra_sizes if s in a.sizes] \
+            if a.extra_orders_explicit else [(s, 0) for s in a.sizes]
+    else:
+        jobs = make_jobs(a.extra_orders, a.extra_sizes)
     pending = []
     for size, order in jobs:
-        name, train, select = commands(size, order, a.steps, SETTINGS["val_every"], SETTINGS["ckpt_every"])
+        name, train, select = commands(size, order, a.steps, SETTINGS["val_every"], SETTINGS["ckpt_every"], a.prefix, a.manifest_dir)
         done = (C.OUTPUT_DIR / "eomt" / name / "best_step.json").exists()
         print(f"{'done   ' if done else 'pending'} {name}")
         if a.dry_run:

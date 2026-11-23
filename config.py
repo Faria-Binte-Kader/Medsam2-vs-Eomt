@@ -27,6 +27,12 @@ CT_ARCHIVES = [
     "ct_scans_1_4_wawtace_09_05_24.zip",
     "ct_scans_2_4_wawtace_09_05_24.zip",
 ]
+# Extension (README, "Further step"): the other two CT archives, used only to add TRAIN patients. Names follow the pattern of
+# archives 1/4 and 2/4; confirm with `python download_data.py --files <names> --dry-run` (it checks them against the Zenodo record).
+CT_ARCHIVES_EXT = [
+    "ct_scans_3_4_wawtace_09_05_24.zip",
+    "ct_scans_4_4_wawtace_09_05_24.zip",
+]
 DEFAULT_FILES = [
     "ct_hcc_metadata_v2.csv",
     "tumor_masks_wawtace_v1_08_05_2024.zip",
@@ -40,6 +46,8 @@ HU_WINDOW = (-140.0, 260.0)
 MASK_INTERPOLATION = "nearest"
 SPLIT_RATIOS = {"train": 0.70, "val": 0.15, "test": 0.15}
 TRAIN_SUBSET_SIZES = [1, 2, 5, 10, 20, "all"]
+EXT_MANIFEST_DIR = _p("WAWTACE_EXT_MANIFEST_DIR", "manifests_ext")  # extension manifests/splits; the frozen manifests/ are never rewritten
+EXT_TRAIN_SUBSET_SIZES = [100, "all"]      # sizes added beyond the original 68 (only those not above the available count are kept)
 
 MEDSAM2 = {
     "repo": "https://github.com/bowang-lab/MedSAM2",
