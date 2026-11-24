@@ -420,7 +420,7 @@ def make_splits(patients, ratios=None, seed=None, subset_sizes=None):
             "train": train, "val": val, "test": test, "train_subsets": subsets, "notes": notes}
 
 
-def extend_splits(base, inventory, new_sizes=None, seed=None):
+def extend_splits(base, inventory, new_sizes=None, seed=None, drop_patients=()):
     """Extension: keep the frozen val/test and every existing train assignment; append newly available primary patients to TRAIN only.
 
     `base` is the frozen splits dict (manifests/splits.json); `inventory` the extended inventory (all four CT archives). New patients
@@ -434,13 +434,18 @@ def extend_splits(base, inventory, new_sizes=None, seed=None):
     missing = sorted(known - set(int(p) for p in prim.patient_id))
     if missing:
         raise ValueError(f"frozen patients no longer primary in the extended inventory: {missing}")
-    fresh = sorted({int(p) for p in prim.patient_id} - known)
+    drop = {int(p) for p in drop_patients}
+    if drop & known:
+        raise ValueError(f"cannot drop frozen patients: {sorted(drop & known)}")
+    fresh = sorted({int(p) for p in prim.patient_id} - known - drop)
     order = [fresh[i] for i in np.random.default_rng(seed).permutation(len(fresh))]
     train = list(base["train"]) + order
     old_all = str(len(base["train"]))
     subsets = {k: list(v) for k, v in base["train_subsets"].items() if k != "all"}
     subsets[old_all] = list(base["train_subsets"]["all"])
     notes = [f"extension: {len(order)} new TRAIN patients appended after the frozen {old_all}; val and test unchanged; old 'all' is now '{old_all}'"]
+    if drop:
+        notes.append(f"{len(drop)} new patients dropped because their volume failed the HU audit: {sorted(drop)}")
     for k in new_sizes:
         size = len(train) if k == "all" else int(k)
         if size > len(train):
@@ -460,7 +465,7 @@ def extend_splits(base, inventory, new_sizes=None, seed=None):
     out = dict(base)
     out.update({"n_patients": len(train) + len(base["val"]) + len(base["test"]),
                 "counts": {k: len(v) for k, v in s.items()}, "train": train, "train_subsets": subsets,
-                "notes": notes, "extension": {"new_train_patients": order, "val_test_unchanged": True}})
+                "notes": notes, "extension": {"new_train_patients": order, "dropped_hu_audit": sorted(drop), "val_test_unchanged": True}})
     return out
 
 
@@ -500,7 +505,11 @@ def cmd_splits(a):
     inv = pd.read_csv(out / "inventory.csv")
     if getattr(a, "extend_from", None):
         base = json.loads(Path(a.extend_from).read_text())
-        sp = extend_splits(base, inv)
+        drop = []
+        if getattr(a, "audit_csv", None):
+            audit = pd.read_csv(a.audit_csv)
+            drop = sorted(int(x) for x in audit[~audit.hu_plausible.astype(bool)].patient_id)
+        sp = extend_splits(base, inv, drop_patients=drop)
         (out / "splits.json").write_text(json.dumps(sp, indent=1))
         print(f"extension: {sp['counts']}, new TRAIN patients {len(sp['extension']['new_train_patients'])}")
         print("nested train subsets:", {k: len(v) for k, v in sp["train_subsets"].items()}, sp["notes"])
@@ -923,6 +932,7 @@ if __name__ == "__main__":
             s.add_argument("--extension", action="store_true", help="also read CT archives 3/4 and 4/4 (config.CT_ARCHIVES_EXT); use with --out-dir manifests_ext")
         if name == "splits":
             s.add_argument("--extend-from", metavar="SPLITS_JSON", help="extension: keep this frozen split and append new patients to TRAIN only")
+            s.add_argument("--audit-csv", help="with --extend-from: drop new patients whose volume failed the HU audit (preprocess_audit.csv)")
         if name == "qc":
             s.add_argument("--n", type=int, default=12)
         if name == "preprocess":

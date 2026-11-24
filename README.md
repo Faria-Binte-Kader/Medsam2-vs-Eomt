@@ -249,7 +249,7 @@ one training seed per run; the validation set (14 patients) is small and used fo
 (a 300-step debug run, the validation pilot, and the sweep above). `--split train` exists only for the sanity check above and writes to `eval_train_debug`.
 
 ## Further step (extension, not part of the results above): more training patients from CT archives 3/4 and 4/4
-**Status: code written and unit-tested; nothing from this step has been run on real data.** Everything above uses CT archives 1/4 and 2/4 only. The masks file contains 120 annotated cases whose CT is in archives 3/4 and 4/4
+**Status: archives 3/4 and 4/4 downloaded (MD5 verified), manifest and preprocessing run; EoMT training on the extended set not yet run.** Everything above uses CT archives 1/4 and 2/4 only. The masks file contains 120 annotated cases whose CT is in archives 3/4 and 4/4
 (logged by `manifest`), which could roughly double the training data. The EoMT learning curve was still rising at 68 patients, so this extension asks whether more labeled data closes the gap to MedSAM2.
 It is reported as an additional step and never merged into the numbers above.
 
@@ -259,13 +259,14 @@ It is reported as an additional step and never merged into the numbers above.
 - New sizes (`config.EXT_TRAIN_SUBSET_SIZES`: 100 and all) use identical settings (6,000 steps, lr 1e-4, 1:1 ratio, seed 42, checkpoint selection on the same validation patients). If validation Dice of the largest run is still rising at step 6,000,
   the step budget for the new sizes is revisited on validation only and recorded before any new test evaluation. Run names start with `ext_`.
 - The same strict matching, exclusions, HU audit and window are applied to the new patients.
+- **Observed so far:** all four archives give 210 primary patients (114 new), 12 secondary (unchanged) and 11 excluded. Preprocessing: 207 of 210 volumes pass the HU audit; patients 325, 452 and 524 (all new) fail the range check (maximum 5,497 to 7,651 HU) and are dropped from the extension, the audit rule being kept as written. The frozen validation and test patients, and the first 68 train patients, are unchanged.
 
 ```bash
 python download_data.py --files ct_scans_3_4_wawtace_09_05_24.zip ct_scans_4_4_wawtace_09_05_24.zip --dry-run   # confirm the names, sizes and free disk (about 20 GB) first
 python download_data.py --files ct_scans_3_4_wawtace_09_05_24.zip ct_scans_4_4_wawtace_09_05_24.zip
 python process_data.py manifest   --extension --out-dir manifests_ext        # all four archives -> manifests_ext/inventory.csv
-python process_data.py splits     --extend-from manifests/splits.json --out-dir manifests_ext
 python process_data.py preprocess --eval-set primary --out-dir manifests_ext # caches only new cases; existing valid caches are reused
+python process_data.py splits     --extend-from manifests/splits.json --audit-csv manifests_ext/preprocess_audit.csv --out-dir manifests_ext   # after preprocessing: drops audit failures
 python run_eomt_sweep.py --sizes 100 all --manifest-dir manifests_ext --prefix ext --dry-run
 python run_eomt_sweep.py --sizes 100 all --manifest-dir manifests_ext --prefix ext --gpus 0 1
 ```

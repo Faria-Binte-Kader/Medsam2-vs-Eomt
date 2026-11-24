@@ -40,3 +40,12 @@ def test_extension_refuses_if_a_frozen_patient_is_no_longer_primary():
     base = _base()
     with pytest.raises(ValueError):
         P.extend_splits(base, _inv(p for p in range(1, 41) if p != base["test"][0]))
+
+
+def test_extension_drops_audit_failures_but_never_frozen_patients():
+    base = _base()
+    ext = P.extend_splits(base, _inv(range(1, 31)), new_sizes=["all"], drop_patients=[25, 28])
+    assert 25 not in ext["train"] and 28 not in ext["train"] and len(ext["train"]) == len(base["train"]) + 8
+    assert ext["extension"]["dropped_hu_audit"] == [25, 28]
+    with pytest.raises(ValueError):
+        P.extend_splits(base, _inv(range(1, 31)), drop_patients=[base["train"][0]])
