@@ -126,6 +126,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
+    a.manifest_dir = str(Path(a.manifest_dir).resolve())  # EoMT runs with its own folder as cwd, so a relative path would break
     sp = json.loads((Path(a.manifest_dir) / "splits.json").read_text())
     if a.n_patients not in sp["train_subsets"]:
         sys.exit(f"--n-patients {a.n_patients} not in {Path(a.manifest_dir) / 'splits.json'}: {list(sp['train_subsets'])}")
