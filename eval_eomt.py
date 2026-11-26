@@ -119,6 +119,7 @@ def main():
     ap.add_argument("--weights", help="a specific weights file (not allowed on test/secondary)")
     ap.add_argument("--device", choices=["cuda", "cpu"], default=C.DEVICE)
     ap.add_argument("--hd95", action="store_true")
+    ap.add_argument("--overwrite-selection", action="store_true", help="with --select: replace an existing best_step.json even if fewer checkpoints remain")
     ap.add_argument("--prune", action="store_true", help="with --select: delete every weights file except the selected one")
     ap.add_argument("--patients", type=int, nargs="+")
     ap.add_argument("--limit", type=int)
@@ -150,6 +151,11 @@ def main():
             print(f"step {step}: mean validation 3D Dice {scores[step]:.4f} ({len(recs)} patients)")
         if not scores:
             sys.exit(f"no weights found in {run / 'weights'}")
+        if best_file.exists() and not a.overwrite_selection:
+            old = json.loads(best_file.read_text()).get("val_dice_by_step", {})
+            if len(old) > len(scores):  # e.g. after --prune: re-selecting from the one kept checkpoint would erase the full curve
+                sys.exit(f"{best_file} already records {len(old)} checkpoints and only {len(scores)} weights remain; "
+                         "not overwriting the selection (pass --overwrite-selection to force)")
         best = select_best(scores)
         (run / "eval_val").mkdir(exist_ok=True)
         pd.DataFrame(allrecs).to_csv(run / "eval_val" / "all_checkpoints_volume_metrics.csv", index=False)
